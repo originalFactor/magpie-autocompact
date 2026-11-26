@@ -1,0 +1,14 @@
+{
+  "provider": {
+    "id": "limited-compact",
+    "name": "受限供应商 · 自动压缩",
+    "baseURL": "https://your-upstream.example/v1",
+    "models": ["your-model-id"],
+    "maxMessages": 80,
+    "maxTurns": 40,
+    "keepTurns": 4,
+    "mode": "responses",
+    "maxRequests": 80,
+    "timeoutMs": 120000
+  }
+}

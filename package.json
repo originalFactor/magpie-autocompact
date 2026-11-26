@@ -1,0 +1,38 @@
+{
+  "name": "magpie-autocompact",
+  "version": "0.4.0",
+  "description": "Provider-specific, transparent conversation compaction for the Magpie gateway",
+  "type": "module",
+  "main": "./autocompact.provider.js",
+  "exports": {
+    ".": "./autocompact.provider.js",
+    "./server": "./autocompact.provider.js"
+  },
+  "files": [
+    "autocompact.provider.js",
+    "lib",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:integration": "node scripts/integration.mjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-provider",
+    "context",
+    "compaction"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "name": "自动上下文压缩",
+    "options": {
+      "provider": null
+    }
+  }
+}
