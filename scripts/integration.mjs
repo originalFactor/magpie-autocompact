@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const sandbox = await mkdtemp(join(tmpdir(), "magpie-autocompact-integration-"));
-const upstreamRequests = [], compactCredentials = [];
+const upstreamRequests = [], upstreamCredentials = [], compactCredentials = [], modelCredentials = [];
 let summaryCalls = 0, compactCalls = 0, rejectSummary = false, gateway, logs = "";
 const storedResponses = new Map(), storedConversations = new Map([["conv_integration", []]]);
 let responseNumber = 0;
@@ -20,6 +20,7 @@ const upstream = createServer(async (req, res) => {
     const path = new URL(req.url, "http://localhost").pathname;
     if (/^\/v1\/responses\//.test(path)) { res.end(JSON.stringify(storedResponses.get(path.split("/").at(-1))?.reply ?? {})); return; }
     if (/^\/v1\/conversations\/[^/]+\/items$/.test(path)) { res.end(JSON.stringify({ data: storedConversations.get(path.split("/").at(-2)) ?? [], has_more: false })); return; }
+    modelCredentials.push(req.headers.authorization);
     res.end(JSON.stringify({ object: "list", data: [{ id: "test", object: "model" }] })); return;
   }
   const body = JSON.parse(raw);
@@ -36,7 +37,7 @@ const upstream = createServer(async (req, res) => {
     compactCalls++; compactCredentials.push(req.headers.authorization);
     res.end(JSON.stringify({ id: "resp_compact", object: "response", status: "completed", output: [{ type: "compaction", id: "cmp_local", encrypted_content: "local-opaque-context" }] })); return;
   }
-  upstreamRequests.push(body);
+  upstreamRequests.push(body); upstreamCredentials.push(req.headers.authorization);
   if (req.url.includes("responses")) {
     const id = `resp_local_${++responseNumber}`;
     const conversation = typeof body.conversation === "string" ? body.conversation : body.conversation?.id;
@@ -216,11 +217,40 @@ try {
   assert.deepEqual(packed.input.slice(-2), toolTail);
   assert.equal(packed.tools[0].name, "read");
   assert.equal(summaryCalls, beforePack, "pack does not call a summary model");
+  await stopGateway();
+  const multi = { providers: {
+    compact_a: { name: "配置供应商 A", baseURL: `${upstreamURL}/v1`, key: "configured-key-a", models: ["test"], maxMessages: 6, keepTurns: 1, mode: "pack" },
+    compact_b: { name: "配置供应商 B", baseURL: `${upstreamURL}/v1`, apiKey: "configured-key-b", maxMessages: 100, mode: "pack" },
+  } };
+  await command(["plugin", "options", "magpie-autocompact", JSON.stringify(multi)]);
+  const multiple = JSON.parse(await command(["plugin", "list", "--json"]));
+  assert.deepEqual(multiple.loaded.find((p) => p.spec === resolve(".")).provides.sort(), ["compact_a", "compact_b"]);
+  assert.ok(modelCredentials.includes("Bearer configured-key-b"), "omitted models fetched during plugin startup");
+  await startGateway();
+  await request("responses", { model: "compact_a/test", input: messages, stream: false });
+  assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-a");
+  assert.ok(upstreamRequests.at(-1).input.length <= 6);
+  await request("responses", { model: "compact_b/test", input: messages, stream: false });
+  assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-b");
+  assert.equal(upstreamRequests.at(-1).input.length, messages.length);
+  assert.match(await request("responses", { model: "compact_a/test", input: messages, stream: true }), /response.completed/);
+  await stopGateway();
+  multi.providers.compact_a.key = "rotated-key-a";
+  // Reorder providers as well: export positions must not define identity.
+  multi.providers = { compact_b: multi.providers.compact_b, compact_a: multi.providers.compact_a };
+  await command(["plugin", "options", "magpie-autocompact", JSON.stringify(multi)]);
+  await startGateway();
+  await request("responses", { model: "compact_a/test", input: "after key update", stream: false });
+  assert.equal(upstreamCredentials.at(-1), "Bearer rotated-key-a");
+  await request("responses", { model: "compact_b/test", input: "other key unchanged", stream: false });
+  assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-b");
   assert.doesNotMatch(logs, /SyntaxError|ReferenceError/i);
-  console.log("PASS: real Magpie Provider + Bun: native supplier form, model discovery, credential storage, all compaction modes, fallback, tool calls, account credentials, previous_response_id, conversation aliases, Chat translation, JSON/SSE, and restart.");
-} catch (error) { console.error(logs); throw error; }
+  console.log("PASS: real Magpie Provider + Bun: multiple configured providers and keys, key rotation, native supplier form, model discovery, credential storage, all compaction modes, fallback, tool calls, account credentials, previous_response_id, conversation aliases, Chat translation, JSON/SSE, and restart.");
+} catch (error) { console.error(logs); console.error(error); throw error; }
 finally {
   await stopGateway();
+  upstream.closeAllConnections();
   await new Promise((r) => upstream.close(r));
-  await rm(sandbox, { recursive: true, force: true });
+  if (process.env.KEEP_INTEGRATION_SANDBOX) console.error("sandbox:", sandbox);
+  else await rm(sandbox, { recursive: true, force: true });
 }

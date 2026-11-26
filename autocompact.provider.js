@@ -1,61 +1,71 @@
-import { providerSettings, accountModels } from "./lib/provider-config.js";
-import { providerForm } from "./lib/provider-form.js";
-import { createSessionTransport } from "./lib/session-transport.js";
+import { providerSlot } from "./lib/provider-plugin.js";
 
-// Magpie treats every exported function as a separate plugin.
-export default {
-  id: "magpie-autocompact",
-  async server(_input, options = {}) {
-    const config = options.provider;
-    if (config?.enabled === false) return {};
-    const id = config?.id ?? "autocompact";
-    if (typeof id !== "string" || !/^[a-z0-9][a-z0-9_-]*$/.test(id)) throw new Error("provider.id must contain lowercase letters, digits, _ or -");
-    const configured = config ? providerSettings(config, id) : null;
-    const settingsFor = (auth) => configured ?? (auth?.metadata?.autocompact ? providerSettings(auth.metadata.autocompact, id) : null);
-    return {
-      async config(cfg) {
-        cfg.provider ??= {};
-        cfg.provider[id] = { name: config?.name ?? "自动压缩 · 自定义供应商", npm: "@ai-sdk/openai", api: configured?.baseURL ?? "", models: configured?.models ?? {} };
-      },
-      auth: {
-        provider: id,
-        methods: configured ? [{ type: "api", label: "上游 API Key", placeholder: "sk-…" }] : [providerForm(id)],
-        async loader(getAuth) {
-          const initial = settingsFor(await getAuth());
-          // Per-account engine: endpoints, policies and credentials stay paired.
-          // Lazy creation keeps listing/login free of filesystem operations.
-          const transports = new Map();
-          return {
-            baseURL: initial?.baseURL ?? "",
-            async fetch(input, init) {
-              const auth = await getAuth();
-              if (auth?.type !== "api" || !auth.key) return Response.json({ error: { message: "Sign in to the compaction provider first" } }, { status: 401 });
-              const settings = settingsFor(auth);
-              if (!settings) return Response.json({ error: { message: "请重新登录自动压缩供应商以填写上游设置" } }, { status: 401 });
-              const signature = JSON.stringify(settings.config);
-              const request = new Request(input, init);
-              // Do not forward account credentials to a stale or overridden URL.
-              const target = new URL(request.url), base = new URL(settings.baseURL + "/");
-              if (target.origin !== base.origin || !target.pathname.startsWith(base.pathname)) return Response.json({ error: { message: "请求地址与当前账号的 Base URL 不匹配，请刷新供应商模型" } }, { status: 400 });
-              const headers = new Headers(request.headers);
-              for (const [key, value] of Object.entries(settings.config.headers ?? {})) headers.set(key, value);
-              headers.set("authorization", `Bearer ${auth.key}`);
-              if (!transports.has(signature)) {
-                const pending = createSessionTransport(settings.transportOptions, { stateDir: settings.stateDir });
-                transports.set(signature, pending);
-                pending.catch(() => { if (transports.get(signature) === pending) transports.delete(signature); });
-              }
-              const transport = transports.get(signature);
-              return (await transport).fetch(id, new Request(request, { headers }));
-            },
-          };
-        },
-      },
-      provider: { id, async models(provider, { auth } = {}) {
-        if (configured) return provider.models;
-        const settings = settingsFor(auth);
-        return settings ? accountModels(settings, id) : {};
-      } },
-    };
-  },
-};
+// Use function exports: default {server} makes Magpie ignore all other exports.
+// Each distinct exported function registers one native Magpie Provider.
+// Unused slots return empty hooks; no files are generated at runtime.
+const primary = (input, options) => providerSlot(0, input, options);
+primary.server = primary;
+export default primary;
+export const Provider02 = (input, options) => providerSlot(1, input, options);
+export const Provider03 = (input, options) => providerSlot(2, input, options);
+export const Provider04 = (input, options) => providerSlot(3, input, options);
+export const Provider05 = (input, options) => providerSlot(4, input, options);
+export const Provider06 = (input, options) => providerSlot(5, input, options);
+export const Provider07 = (input, options) => providerSlot(6, input, options);
+export const Provider08 = (input, options) => providerSlot(7, input, options);
+export const Provider09 = (input, options) => providerSlot(8, input, options);
+export const Provider10 = (input, options) => providerSlot(9, input, options);
+export const Provider11 = (input, options) => providerSlot(10, input, options);
+export const Provider12 = (input, options) => providerSlot(11, input, options);
+export const Provider13 = (input, options) => providerSlot(12, input, options);
+export const Provider14 = (input, options) => providerSlot(13, input, options);
+export const Provider15 = (input, options) => providerSlot(14, input, options);
+export const Provider16 = (input, options) => providerSlot(15, input, options);
+export const Provider17 = (input, options) => providerSlot(16, input, options);
+export const Provider18 = (input, options) => providerSlot(17, input, options);
+export const Provider19 = (input, options) => providerSlot(18, input, options);
+export const Provider20 = (input, options) => providerSlot(19, input, options);
+export const Provider21 = (input, options) => providerSlot(20, input, options);
+export const Provider22 = (input, options) => providerSlot(21, input, options);
+export const Provider23 = (input, options) => providerSlot(22, input, options);
+export const Provider24 = (input, options) => providerSlot(23, input, options);
+export const Provider25 = (input, options) => providerSlot(24, input, options);
+export const Provider26 = (input, options) => providerSlot(25, input, options);
+export const Provider27 = (input, options) => providerSlot(26, input, options);
+export const Provider28 = (input, options) => providerSlot(27, input, options);
+export const Provider29 = (input, options) => providerSlot(28, input, options);
+export const Provider30 = (input, options) => providerSlot(29, input, options);
+export const Provider31 = (input, options) => providerSlot(30, input, options);
+export const Provider32 = (input, options) => providerSlot(31, input, options);
+export const Provider33 = (input, options) => providerSlot(32, input, options);
+export const Provider34 = (input, options) => providerSlot(33, input, options);
+export const Provider35 = (input, options) => providerSlot(34, input, options);
+export const Provider36 = (input, options) => providerSlot(35, input, options);
+export const Provider37 = (input, options) => providerSlot(36, input, options);
+export const Provider38 = (input, options) => providerSlot(37, input, options);
+export const Provider39 = (input, options) => providerSlot(38, input, options);
+export const Provider40 = (input, options) => providerSlot(39, input, options);
+export const Provider41 = (input, options) => providerSlot(40, input, options);
+export const Provider42 = (input, options) => providerSlot(41, input, options);
+export const Provider43 = (input, options) => providerSlot(42, input, options);
+export const Provider44 = (input, options) => providerSlot(43, input, options);
+export const Provider45 = (input, options) => providerSlot(44, input, options);
+export const Provider46 = (input, options) => providerSlot(45, input, options);
+export const Provider47 = (input, options) => providerSlot(46, input, options);
+export const Provider48 = (input, options) => providerSlot(47, input, options);
+export const Provider49 = (input, options) => providerSlot(48, input, options);
+export const Provider50 = (input, options) => providerSlot(49, input, options);
+export const Provider51 = (input, options) => providerSlot(50, input, options);
+export const Provider52 = (input, options) => providerSlot(51, input, options);
+export const Provider53 = (input, options) => providerSlot(52, input, options);
+export const Provider54 = (input, options) => providerSlot(53, input, options);
+export const Provider55 = (input, options) => providerSlot(54, input, options);
+export const Provider56 = (input, options) => providerSlot(55, input, options);
+export const Provider57 = (input, options) => providerSlot(56, input, options);
+export const Provider58 = (input, options) => providerSlot(57, input, options);
+export const Provider59 = (input, options) => providerSlot(58, input, options);
+export const Provider60 = (input, options) => providerSlot(59, input, options);
+export const Provider61 = (input, options) => providerSlot(60, input, options);
+export const Provider62 = (input, options) => providerSlot(61, input, options);
+export const Provider63 = (input, options) => providerSlot(62, input, options);
+export const Provider64 = (input, options) => providerSlot(63, input, options);

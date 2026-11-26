@@ -89,3 +89,95 @@ test("explicit provider options retain the existing key-only login", async () =>
   assert.equal(config.provider.legacy.models.test.tool_call, true);
   assert.equal((await hooks.auth.loader(async () => ({ type: "api", key: "key" }))).baseURL, "https://a.example/v1");
 });
+
+test("multiple explicit providers register independent native hooks and configured credentials", async () => {
+  const { Provider02, Provider03 } = await import("../autocompact.provider.js");
+  const saved = [], input = { client: { auth: { set: async (v) => saved.push(v) } } };
+  const options = { providers: {
+    first: { baseURL: "https://first.example/v1", models: ["a"], key: "first-key", maxTurns: 3 },
+    second: { baseURL: "https://second.example/v1", models: ["b"], apiKey: "second-key", maxMessages: 20 },
+  } };
+  const a = await plugin.server(input, options), b = await Provider02(input, options);
+  assert.deepEqual(await Provider03(input, options), {});
+  assert.equal(a.auth.provider, "first"); assert.equal(b.auth.provider, "second");
+  const cfg = {}; await a.config(cfg); await b.config(cfg);
+  assert.deepEqual(Object.keys(cfg.provider), ["first", "second"]);
+  assert.deepEqual(saved.map((v) => [v.path.id, v.body.key]), [["first", "first-key"], ["second", "second-key"]]);
+  assert.doesNotMatch(JSON.stringify(cfg), /first-key|second-key/);
+  assert.equal((await b.auth.loader(async () => null)).baseURL, "https://second.example/v1");
+});
+
+test("invalid multi-provider configuration is rejected before credential writes", async () => {
+  const { Provider02 } = await import("../autocompact.provider.js");
+  const good = { baseURL: "https://example.com/v1", models: ["test"], maxTurns: 3, key: "key" };
+  let writes = 0;
+  const input = { client: { auth: { set: async () => writes++ } } };
+  for (const options of [
+    { provider: good, providers: {} }, { providers: [] },
+    { providers: { first: good, second: { ...good, key: "" } } },
+    { providers: { first: { ...good, apiKey: "different-key" } } },
+    { providers: { first: { ...good, id: "other" } } },
+    { providers: { "invalid#id": good } },
+    { providers: Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`p${i}`, good])) },
+  ]) await assert.rejects(plugin.server(input, options));
+  assert.equal(writes, 0);
+  assert.deepEqual(await plugin.server(input, { providers: {} }), {});
+  assert.deepEqual(await Provider02(input, {}), {});
+  const disabled = await plugin.server(input, { providers: { off: { enabled: false }, on: good } });
+  assert.deepEqual(disabled, {});
+  assert.equal((await Provider02(input, { providers: { off: { enabled: false }, on: good } })).auth.provider, "on");
+});
+
+test("omitted models are discovered at startup with configured key and headers, then cached", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  let calls = 0;
+  globalThis.fetch = async (url, init) => {
+    calls++;
+    assert.equal(String(url), "https://example.com/v1/models");
+    assert.equal(init.headers.get("authorization"), "Bearer configured-key");
+    assert.equal(init.headers.get("openai-project"), "project-a");
+    assert.equal(init.redirect, "error");
+    return Response.json({ data: [{ id: "a" }, { id: "a" }, { id: "b" }, {}] });
+  };
+  const hooks = await plugin.server({ client: { auth: { set: async () => {} } } }, { provider: {
+    baseURL: "https://example.com/v1", key: "configured-key", headers: { "openai-project": "project-a" }, maxTurns: 3,
+  } });
+  const cfg = {}; await hooks.config(cfg);
+  assert.deepEqual(Object.keys(cfg.provider.autocompact.models), ["a", "b"]);
+  const models = await hooks.provider.models({ models: {} });
+  assert.equal(models.a.api.url, "https://example.com/v1");
+  assert.equal(calls, 1);
+});
+
+test("model discovery without configured key waits for login and retries failures", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  let calls = 0;
+  globalThis.fetch = async (_url, init) => {
+    calls++;
+    assert.equal(init.headers.get("authorization"), "Bearer login-key");
+    if (calls === 1) return Response.json({ detail: "secret-login-key" }, { status: 503 });
+    return Response.json({ data: [{ id: "available" }] });
+  };
+  const hooks = await plugin.server({}, { provider: { baseURL: "https://example.com/v1", maxTurns: 3 } });
+  const cfg = {}; await hooks.config(cfg);
+  assert.equal(calls, 0);
+  assert.deepEqual(cfg.provider.autocompact.models, {});
+  const args = { auth: { type: "api", key: "login-key" } };
+  await assert.rejects(hooks.provider.models({ models: {} }, args), /HTTP 503/);
+  assert.equal((await hooks.provider.models({ models: {} }, args)).available.api.id, "available");
+  assert.equal(calls, 2);
+});
+
+test("failed startup discovery preserves registration and explicit empty models are invalid", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async () => Response.json({ data: [] });
+  const config = { baseURL: "https://example.com/v1", maxTurns: 3, key: "key" };
+  const hooks = await plugin.server({ client: { auth: { set: async () => {} } } }, { provider: config });
+  const cfg = {};
+  await assert.rejects(hooks.config(cfg), /未返回有效模型列表/);
+  assert.ok(cfg.provider.autocompact);
+  await assert.rejects(plugin.server({}, { provider: { ...config, models: [] } }), /至少填写一个模型/);
+});

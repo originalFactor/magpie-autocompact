@@ -1,6 +1,6 @@
 {
   "name": "magpie-autocompact",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "description": "Provider-specific, transparent conversation compaction for the Magpie gateway",
   "type": "module",
   "main": "./autocompact.provider.js",
