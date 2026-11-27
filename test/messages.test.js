@@ -23,7 +23,7 @@ function tools(protocol, n = 100) {
   ]).flat()];
 }
 
-async function fixture(t, protocol, settings = {}) {
+async function fixture(t, protocol, settings = {}, fetchImpl) {
   const root = await mkdtemp(join(tmpdir(), "magpie-message-test-"));
   const calls = [], summaries = [], forbidden = [], controls = { summary: "ok", reject: false, truncate: false };
   const server = createServer(async (req, res) => {
@@ -57,13 +57,16 @@ async function fixture(t, protocol, settings = {}) {
       res.write(first.slice(0, 17)); res.write(first.slice(17));
       if (controls.truncate) { res.end(); return; }
       if (protocol === "chat") res.end(frame({ id: "chatcmpl-test", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) + "data: [DONE]\r\n\r\n");
-      else res.end(frame({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }) + frame({ type: "message_stop" }));
+      else res.end(frame({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+        + frame({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ACK" } })
+        + frame({ type: "content_block_stop", index: 0 })
+        + frame({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }) + frame({ type: "message_stop" }));
     } catch (error) { res.writeHead(500).end(JSON.stringify({ error: { message: error.message } })); }
   });
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   const baseURL = `http://127.0.0.1:${server.address().port}/v1`;
   const configured = providerSettings({ protocol, baseURL, models: ["test"], maxMessages: 6, ...settings }, "test");
-  let transport = await createSessionTransport(configured.transportOptions, { stateDir: root });
+  let transport = await createSessionTransport(configured.transportOptions, { stateDir: root, fetchImpl });
   const url = configured.transportOptions.providers.test.stateful.url;
   const request = (body, { key = "account-key", session = "client-session", path = url, signal } = {}) => transport.fetch("test", path, {
     method: path.endsWith("/models") ? "GET" : "POST", signal,
@@ -71,10 +74,50 @@ async function fixture(t, protocol, settings = {}) {
     body: path.endsWith("/models") ? undefined : JSON.stringify({ model: "test", max_tokens: 512, ...body }),
   });
   t.after(async () => { await transport.close(); server.closeAllConnections(); await new Promise((r) => server.close(r)); await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
-  return { calls, summaries, forbidden, controls, request, baseURL, async restart() { await transport.close(); transport = await createSessionTransport(configured.transportOptions, { stateDir: root }); } };
+  return { calls, summaries, forbidden, controls, request, baseURL, async restart() { await transport.close(); transport = await createSessionTransport(configured.transportOptions, { stateDir: root, fetchImpl }); } };
 }
 
 for (const protocol of ["chat", "anthropic"]) {
+  test(`${protocol}: notice is readable while upstream inference is waiting`, async (t) => {
+    let release;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    t.after(() => release());
+    const f = await fixture(t, protocol, { compactionNotice: "Compacted" }, async (url, init) => {
+      const body = JSON.parse(init.body);
+      const summary = (protocol === "chat" ? body.messages[0].content : body.system)?.startsWith?.("Summarize the historical conversation");
+      if (!summary) await waiting;
+      return fetch(url, init);
+    });
+    const response = await f.request({ messages: history(), stream: true });
+    const reader = response.body.getReader();
+    const first = new TextDecoder().decode((await reader.read()).value);
+    assert.match(first, /Compacted/);
+    assert.doesNotMatch(first, /\[DONE\]|message_stop/);
+    assert.equal(f.calls.length, 0);
+    release();
+    let rest = "";
+    for (;;) { const part = await reader.read(); if (part.done) break; rest += new TextDecoder().decode(part.value); }
+    assert.match(rest, /ACK/);
+    assert.match(rest, protocol === "chat" ? /\[DONE\]/ : /message_stop/);
+    assert.equal(f.calls.length, 1);
+    if (protocol === "anthropic") {
+      assert.doesNotMatch(rest, /message_start/);
+      assert.match(rest, /"index":1/);
+      assert.match(rest, /"input_tokens":10/);
+    }
+  });
+
+  test(`${protocol}: notice streams fail on rejected or truncated inference without caching success`, async (t) => {
+    const f = await fixture(t, protocol, { compactionNotice: true });
+    f.controls.reject = true;
+    await assert.rejects(async () => (await f.request({ messages: history(), stream: true })).text());
+    f.controls.reject = false; f.controls.truncate = true;
+    await assert.rejects(async () => (await f.request({ messages: history(), stream: true })).text());
+    f.controls.truncate = false;
+    await (await f.request({ messages: history() })).json();
+    assert.equal(f.summaries.length, 3);
+  });
+
   test(`${protocol}: notice only follows successful compaction, including pack fallback`, async (t) => {
     const f = await fixture(t, protocol, { compactionNotice: true });
     const normal = await f.request({ messages: [{ role: "user", content: "hello" }] });
@@ -84,18 +127,18 @@ for (const protocol of ["chat", "anthropic"]) {
     const packed = await f.request({ messages: history() });
     const reply = await packed.json();
     assert.equal(packed.status, 200);
-    assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content[0].text, "上下文已压缩，请继续。");
-    assert.equal(f.calls.length, 1);
+    assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), "上下文已压缩，请继续。\n\nACK");
+    assert.equal(f.calls.length, 2);
     const opaque = history().map((item) => ({ ...item }));
     opaque[0].content = [{ type: "image", source: { type: "base64", media_type: "image/png", data: "opaque" } }];
     const failed = await f.request({ messages: opaque });
     assert.equal(failed.status, 422);
     assert.equal((await failed.json()).error.code, "compaction_failed");
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 2);
   });
 
   for (const stream of [false, true]) {
-    test(`${protocol}: compaction notice returns immediately and persists the prefix (stream=${stream})`, async (t) => {
+    test(`${protocol}: compaction notice precedes inference and persists the prefix (stream=${stream})`, async (t) => {
       const f = await fixture(t, protocol, { compactionNotice: "压缩完成，可以继续。" });
       const messages = history();
       const response = await f.request({ messages, stream });
@@ -106,16 +149,16 @@ for (const protocol of ["chat", "anthropic"]) {
         assert.match(events, protocol === "chat" ? /\[DONE\]/ : /message_stop/);
       } else {
         const reply = await response.json();
-        assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content[0].text, "压缩完成，可以继续。");
+        assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), "压缩完成，可以继续。\n\nACK");
       }
-      assert.equal(f.calls.length, 0);
+      assert.equal(f.calls.length, 1);
       assert.equal(f.summaries.length, 1);
       await f.restart();
       const next = await f.request({ messages: [...messages, { role: "assistant", content: "压缩完成，可以继续。" }, { role: "user", content: "continue" }] });
       assert.equal(next.status, 200); await next.json();
       assert.equal(f.summaries.length, 1);
-      assert.equal(f.calls.length, 1);
-      assert.match(JSON.stringify(f.calls[0].body.messages), /Keep the task goal/);
+      assert.equal(f.calls.length, 2);
+      assert.match(JSON.stringify(f.calls[1].body.messages), /Keep the task goal/);
     });
   }
 

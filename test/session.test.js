@@ -125,7 +125,9 @@ async function fixture(t, policy = {}, fetchImpl) {
       res.write(first.slice(0, 19)); res.write(first.slice(19));
       if (body.metadata?.delayFinal) await new Promise((r) => setTimeout(r, body.metadata.delayFinal));
       if (body.metadata?.truncate) { res.end(); return; }
+      res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: output[0] })}\n\n`);
       res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "streamed text" })}\n\n`);
+      res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: output[0] })}\n\n`);
       res.end(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: reply })}\n\n`);
     } catch (error) { res.writeHead(500).end(JSON.stringify({ error: String(error) })); }
   });
@@ -166,7 +168,7 @@ async function fixture(t, policy = {}, fetchImpl) {
 }
 
 for (const stream of [false, true]) {
-  test(`compaction notice persists a local response and resumes after restart (stream=${stream})`, async (t) => {
+  test(`compaction notice continues inference and resumes after restart (stream=${stream})`, async (t) => {
     const f = await fixture(t, { maxMessages: 8, compactionNotice: true, stateful: { maxRequests: 1 } });
     const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
     const response = await f.request({ input, stream });
@@ -176,51 +178,100 @@ for (const stream of [false, true]) {
       const events = (await response.text()).split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
       assert.equal(events[0].type, "response.created");
       assert.equal(events.at(-1).type, "response.completed");
-      assert.equal(events.find((event) => event.type === "response.output_text.delta").delta, "上下文已压缩，请继续。");
+      assert.equal(events.find((event) => event.type === "response.output_text.delta").delta, "上下文已压缩，请继续。\n\n");
       reply = events.at(-1).response;
     } else reply = await response.json();
-    assert.equal(reply.output[0].content[0].text, "上下文已压缩，请继续。");
-    assert.equal(f.calls.length, 0);
+    assert.equal(reply.output[0].content[0].text, "上下文已压缩，请继续。\n\n");
+    assert.equal(f.calls.length, 1);
+    assert.equal(reply.output.length, 2);
+    assert.match(reply.output[1].content[0].text, /reply resp_/);
     assert.equal(f.compactions.length, 1);
     await f.restart();
     const retrieved = await f.request(undefined, { path: `/responses/${reply.id}`, method: "GET" });
     assert.deepEqual(await retrieved.json(), reply);
     const next = await f.turn({ previous_response_id: reply.id, input: "continue" });
     assert.equal(next.previous_response_id, reply.id);
-    assert.equal(f.calls.length, 1);
-    assert.equal(f.calls[0].body.previous_response_id, undefined);
-    assert.equal(f.calls[0].sessionId, undefined);
-    assert.equal(f.calls[0].body.input[0].type, "compaction");
-    assert.match(JSON.stringify(f.calls[0].body.input), /上下文已压缩/);
+    assert.equal(f.calls.length, 2);
+    assert.equal(f.calls[1].body.previous_response_id, undefined);
+    assert.ok(f.calls[1].sessionId);
+    assert.equal(f.calls[1].body.input[0].type, "compaction");
+    assert.match(JSON.stringify(f.calls[1].body.input), /上下文已压缩/);
   });
 }
 
-test("Responses compaction notice also returns after pack fallback without inference", async (t) => {
+test("Responses notice is readable before upstream headers and shares one response lifecycle", async (t) => {
+  let release;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  t.after(() => release());
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Compacted" }, async (url, init) => {
+    const body = init.body && JSON.parse(init.body);
+    if (body?.input?.at(-1)?.type !== "compaction_trigger") await waiting;
+    return fetch(url, init);
+  });
+  const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
+  const response = await f.request({ input, stream: true, metadata: { tool: true } });
+  const reader = response.body.getReader();
+  let text = new TextDecoder().decode((await reader.read()).value);
+  assert.match(text, /Compacted/);
+  assert.doesNotMatch(text, /response.completed/);
+  assert.equal(f.calls.length, 0);
+  release();
+  for (;;) { const part = await reader.read(); if (part.done) break; text += new TextDecoder().decode(part.value); }
+  const events = text.split(/\r?\n/).filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+  assert.equal(events.filter((event) => event.type === "response.created").length, 1);
+  assert.equal(events.filter((event) => event.type === "response.completed").length, 1);
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index));
+  const reply = events.at(-1).response;
+  assert.equal(reply.id, events[0].response.id);
+  assert.equal(reply.output[1].type, "function_call");
+  assert.equal(events.find((event) => event.type === "response.output_item.done" && event.item.type === "function_call").output_index, 1);
+  await f.restart();
+  await f.turn({ previous_response_id: reply.id, input: [{ type: "function_call_output", call_id: "active_call", output: "tool result" }] });
+  assert.equal(f.calls.at(-1).body.input.at(-2).type, "function_call");
+});
+
+test("truncated Responses notice streams recover the upstream reply after restart", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Compacted" });
+  const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
+  const response = await f.request({ input, stream: true, metadata: { truncate: true } });
+  const reader = response.body.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  const id = JSON.parse(first.split("\n").find((line) => line.startsWith("data: ")).slice(6)).response.id;
+  await assert.rejects(async () => { while (!(await reader.read()).done) {} });
+  await f.restart();
+  await f.turn({ previous_response_id: id, input: "continue" });
+  assert.equal(f.calls.length, 2);
+  assert.match(JSON.stringify(f.calls[1].body.input), /reply resp_/);
+  const retrieved = await f.request(undefined, { path: `/responses/${id}`, method: "GET" });
+  assert.equal((await retrieved.json()).output[0].content[0].text, "Compacted\n\n");
+});
+
+test("Responses compaction notice continues inference after pack fallback", async (t) => {
   const f = await fixture(t, { maxMessages: 8, compactionNotice: "Packed" });
   f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
   const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
   const reply = await f.turn({ input, store: false });
-  assert.equal(reply.output[0].content[0].text, "Packed");
-  assert.equal(f.calls.length, 0);
+  assert.equal(reply.output[0].content[0].text, "Packed\n\n");
+  assert.equal(f.calls.length, 1);
   await f.restart();
   await f.turn({ input: [...input, { role: "assistant", content: "Packed" }, { role: "user", content: "continue" }], store: false });
-  assert.equal(f.calls.length, 1);
-  assert.match(f.calls[0].body.input[0].content, /original_messages_json/);
+  assert.equal(f.calls.length, 2);
+  assert.match(f.calls[1].body.input[0].content, /original_messages_json/);
 });
 
 test("conversation compaction notice updates the shadow before returning", async (t) => {
   const f = await fixture(t, { maxMessages: 8, compactionNotice: "Ready to continue" });
   f.conversations.set("conv_notice", Array.from({ length: 8 }, (_, index) => ({ id: `item_notice_${index}`, role: index % 2 ? "assistant" : "user", content: `turn ${index}` })));
   const reply = await f.turn({ conversation: "conv_notice", input: "new task" });
-  assert.equal(reply.output[0].content[0].text, "Ready to continue");
-  assert.equal(f.calls.length, 0);
+  assert.equal(reply.output[0].content[0].text, "Ready to continue\n\n");
+  assert.equal(f.calls.length, 1);
   await f.restart();
   await f.turn({ conversation: "conv_notice", input: "continue" });
-  assert.equal(f.calls.length, 1);
-  const history = f.conversations.get(f.calls[0].body.conversation);
+  assert.equal(f.calls.length, 2);
+  const history = f.conversations.get(f.calls[1].body.conversation);
   assert.equal(history[0].type, "compaction");
   assert.match(JSON.stringify(history), /new task/);
-  assert.match(JSON.stringify(history), /Ready to continue/);
+  assert.match(JSON.stringify(history), /reply resp_/);
 });
 
 test("previous_response_id creates a fresh compacted chain and echoes the client's parent", async (t) => {

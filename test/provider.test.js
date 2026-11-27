@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, after, test } from "node:test";
 import plugin, { Provider02 } from "../autocompact.provider.js";
 import { apiBase, providerSettings, accountHeaders } from "../lib/provider-config.js";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -8,6 +8,9 @@ import { join } from "node:path";
 
 const inputs = { baseURL: "https://a.example/v1/" };
 const client = { client: { auth: { set: async () => {} } } };
+const networkFetch = globalThis.fetch;
+before(() => { globalThis.fetch = async (url, init) => String(url) === "https://pi.dev/api/models" ? Response.json({}) : networkFetch(url, init); });
+after(() => { globalThis.fetch = networkFetch; });
 
 test("unconfigured installation registers no providers or login entry", async () => {
   for (const options of [undefined, {}, { providers: {} }]) {

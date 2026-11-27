@@ -374,10 +374,10 @@ try {
   assert.notEqual(upstreamSessions.at(-1).id, upstreamSessions.at(-2).id);
   await stopGateway();
   const multi = { providers: {
-    compact_a: { name: "配置供应商 A", baseURL: `${upstreamURL}/v1`, key: "configured-key-a", models: ["test"], maxMessages: 6, enablePack: true, enableAlphaSearch: true },
+    compact_a: { name: "配置供应商 A", baseURL: `${upstreamURL}/v1`, key: "configured-key-a", models: ["test"], maxMessages: 6, enablePack: true, enableAlphaSearch: true, compactionNotice: "Context compacted" },
     compact_b: { name: "配置供应商 B", baseURL: `${upstreamURL}/v1`, apiKey: "configured-key-b", enablePack: false },
-    chat_upstream: { protocol: "chat", baseURL: `${upstreamURL}/v1`, key: "configured-chat-key", models: ["chat-test"], maxMessages: 6, enablePack: false },
-    anthropic_upstream: { protocol: "anthropic", baseURL: `${upstreamURL}/v1`, key: "configured-anthropic-key", models: ["anthropic-test"], maxMessages: 6, enablePack: true },
+    chat_upstream: { protocol: "chat", baseURL: `${upstreamURL}/v1`, key: "configured-chat-key", models: ["chat-test"], maxMessages: 6, enablePack: false, compactionNotice: "Context compacted" },
+    anthropic_upstream: { protocol: "anthropic", baseURL: `${upstreamURL}/v1`, key: "configured-anthropic-key", models: ["anthropic-test"], maxMessages: 6, enablePack: true, compactionNotice: "Context compacted" },
   } };
   await command(["plugin", "options", "magpie-autocompact", JSON.stringify(multi)]);
   const multiple = JSON.parse(await command(["plugin", "list", "--json"]));
@@ -402,24 +402,29 @@ try {
     if (process.env.REQUIRE_ALPHA_SEARCH === "1") throw new Error("Magpie registered native search, but its alpha/search gateway did not forward plugin providers");
     console.log("LIMITATION: Magpie registers searches:true, but alpha/search does not reach plugin providers; its fallback is not native search success.");
   }
-  await request("responses", { model: "compact_a/test", input: messages, stream: false });
+  const noticeReply = await request("responses", { model: "compact_a/test", input: messages, stream: false });
+  assert.match(noticeReply, /Context compacted/); assert.match(noticeReply, /native reply/);
   assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-a");
   assert.ok(upstreamRequests.at(-1).input.length <= 6);
   await request("responses", { model: "compact_b/test", input: messages, stream: false });
   assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-b");
   assert.equal(upstreamRequests.at(-1).input.length, messages.length);
-  assert.match(await request("responses", { model: "compact_a/test", input: messages, stream: true }), /response.completed/);
+  const freshMessages = [{ ...messages[0], content: "Fresh history for streaming" }, ...messages.slice(1)];
+  const noticeStream = await request("responses", { model: "compact_a/test", input: freshMessages, stream: true });
+  assert.match(noticeStream, /Context compacted/); assert.match(noticeStream, /native reply/); assert.match(noticeStream, /response.completed/);
   const beforeNonResponses = compactionAttempts.length;
   const chat = await request("responses", { model: "chat_upstream/chat-test", input: messages, stream: false });
-  assert.match(chat, /transparent reply/);
+  assert.match(chat, /Context compacted/); assert.match(chat, /transparent reply/);
   assert.equal(messageRequests.at(-1).path, "/v1/chat/completions");
   assert.equal(messageRequests.at(-1).headers.authorization, "Bearer configured-chat-key");
   assert.ok(messageRequests.at(-1).body.messages.length <= 6);
   assert.match(JSON.stringify(messageRequests.at(-1).body.messages), /Summary from message model/);
   assert.equal(messageSummaries.at(-1).path, "/v1/chat/completions");
+  const chatNoticeStream = await request("responses", { model: "chat_upstream/chat-test", input: freshMessages, stream: true });
+  assert.match(chatNoticeStream, /Context compacted/); assert.match(chatNoticeStream, /transparent/); assert.match(chatNoticeStream, /response.completed/);
   rejectMessageSummary = true;
   const anthropic = await request("responses", { model: "anthropic_upstream/anthropic-test", input: messages, stream: true });
-  assert.match(anthropic, /anthropic reply/); assert.match(anthropic, /response.completed/);
+  assert.match(anthropic, /Context compacted/); assert.match(anthropic, /anthropic reply/); assert.match(anthropic, /response.completed/);
   assert.equal(messageRequests.at(-1).path, "/v1/messages");
   assert.equal(messageRequests.at(-1).headers["x-api-key"], "configured-anthropic-key");
   assert.equal(messageRequests.at(-1).headers.authorization, undefined);
