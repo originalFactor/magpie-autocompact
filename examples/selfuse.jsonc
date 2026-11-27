@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "example": { // magpie 的供应商 id, 比如本配置模型 id 为 example-provider/example-model
+      "baseURL": "https://example.com/v1",
+      "compactionNotice": true, // 开启压缩成功提示
+      "enableAlphaSearch": true, // 开启 Codex 原生搜索
+      "enablePack": false, // 关闭打包(没有缓存)
+      "headers": {
+        "User-Agent": "codex_cli_rs/0.172.0 (Windows; x86_64) WindowsTerminal" // 绕过中转站客户端限制
+      },
+      "key": "sk-xxx",
+      "maxMessages": 80, // 80 条消息后压缩, 用户消息/agent消息/工具调用都算一条
+      "name": "example", // 显示名称
+      "responses": {
+        "maxInputChars": 10000000, // 历史前缀 JSON 的字符数上限；0 为不限。
+        "timeoutMs": 300000  // 每次原生压缩尝试的超时，单位 ms；0 为不限。
+      },
+      "summary": {
+        "maxInputChars": 10000000, // 历史前缀 JSON 的字符数上限；0 为不限。
+        "maxTokens": 16000, // 0 为不发送输出 token 上限，由上游决定。
+        "timeoutMs": 300000 // 0 为不限；整个请求及目标供应商的超时仍生效。
+      }
+    }
+  }
+}
