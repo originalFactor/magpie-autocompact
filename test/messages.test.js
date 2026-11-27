@@ -225,8 +225,7 @@ for (const protocol of ["chat", "anthropic"]) {
 
   test(`${protocol}: opaque history fails explicitly and native Responses routes are blocked`, async (t) => {
     const f = await fixture(t, protocol);
-    const messages = history(); messages[1].content = protocol === "chat" ? [{ type: "image_url", image_url: { url: "https://example.com/image.png" } }]
-      : [{ type: "thinking", thinking: "Opaque reasoning", signature: "opaque-signature" }];
+    const messages = history(); messages[1].content = [{ type: "thinking", thinking: "Opaque reasoning", signature: "opaque-signature" }];
     const response = await f.request({ messages }); assert.equal(response.status, 422);
     const { error } = await response.json(); assert.equal(error.code, "compaction_failed");
     assert.deepEqual(error.attempts.map((a) => a.method), ["summary", "pack"]);
