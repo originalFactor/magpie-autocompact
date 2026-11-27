@@ -6,22 +6,35 @@ import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createSessionTransport } from "../lib/session-transport.js";
+import { clientSessionKey, mappedRequest } from "../lib/session-identity.js";
 
 async function fixture(t, policy = {}, fetchImpl) {
   const root = await mkdtemp(join(tmpdir(), "magpie-server-session-test-"));
   const responses = new Map(), conversations = new Map([["conv_client", []]]), calls = [], compactions = [], summaries = [];
-  let counter = 0, failCompaction = false, delayCompaction = 0;
+  const sessionTurns = new Map(), managementCalls = [];
+  const compactEndpoints = [], alphaSearches = [];
+  let counter = 0, failCompaction = false, failCompactEndpoint = false, failSummary = false, summaryFailure = "summary unavailable", delayCompaction = 0, modelTurnLimit = Infinity, sessionTurnLimit = Infinity;
   const upstream = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://local");
       let raw = ""; for await (const chunk of req) raw += chunk;
       const body = raw ? JSON.parse(raw) : undefined;
+      const sessionId = req.headers["session-id"] ?? req.headers.session_id ?? body?.prompt_cache_key;
       res.setHeader("content-type", "application/json");
-      if (req.url === "/summarize") {
+      if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
+        alphaSearches.push({ raw, body, sessionId, headers: { ...req.headers } });
+        res.setHeader("x-native-search", "retained");
+        res.end(JSON.stringify({ encrypted_output: "opaque-search-state", output: "Native search result", results: [
+          { type: "text_result", ref_id: "turn0search0", url: "https://example.com/result" },
+        ] })); return;
+      }
+      if (req.url === "/summary-api/v1/chat/completions") {
         summaries.push({ body, authorization: req.headers.authorization });
+        if (failSummary) { res.writeHead(503).end(JSON.stringify({ error: { code: "summary_down", message: summaryFailure } })); return; }
         res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "Historical task summary." } }] })); return;
       }
       if (req.method === "GET" && /^\/v1\/responses\/[^/]+$/.test(url.pathname)) {
+        managementCalls.push({ path: url.pathname, sessionId });
         const record = responses.get(decodeURIComponent(url.pathname.split("/").at(-1)));
         if (!record) { res.writeHead(404).end("{}"); return; }
         res.end(JSON.stringify(record.reply)); return;
@@ -34,6 +47,13 @@ async function fixture(t, policy = {}, fetchImpl) {
         const data = items.slice(start, start + 2);
         res.end(JSON.stringify({ data, has_more: start + 2 < items.length, last_id: data.at(-1)?.id })); return;
       }
+      if (req.method === "POST" && url.pathname.endsWith("/items")) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-2));
+        const items = conversations.get(id);
+        if (!items) { res.writeHead(404).end("{}"); return; }
+        items.push(...body.items.map((item) => ({ ...item, id: item.id ?? `item_${++counter}` })));
+        res.end(JSON.stringify({ data: body.items, has_more: false })); return;
+      }
       if (req.method === "POST" && url.pathname === "/v1/conversations") {
         const id = `conv_shadow_${++counter}`;
         conversations.set(id, (body.items ?? []).map((x) => ({ ...x, id: x.id ?? `item_${++counter}` })));
@@ -42,12 +62,43 @@ async function fixture(t, policy = {}, fetchImpl) {
       if (req.method === "GET" && /^\/v1\/conversations\/[^/]+$/.test(url.pathname)) {
         res.end(JSON.stringify({ id: url.pathname.split("/").at(-1), object: "conversation" })); return;
       }
+      if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
+        compactEndpoints.push({ body, sessionId, headers: { ...req.headers } });
+        if (failCompactEndpoint) { res.writeHead(429).end(JSON.stringify({ error: { type: "rate_limit_error", message: "compact endpoint unavailable" } })); return; }
+        res.end(JSON.stringify({ id: `cmp_window_${++counter}`, object: "response.compaction", output: [
+          { role: "user", content: "Preserved by standalone compact endpoint." }, { type: "compaction", encrypted_content: "sealed-endpoint-prefix" },
+        ] })); return;
+      }
       if (req.method !== "POST" || url.pathname !== "/v1/responses") { res.writeHead(404).end("{}"); return; }
+      if (sessionId) {
+        const turns = sessionTurns.get(sessionId) ?? 0;
+        if (turns >= sessionTurnLimit) {
+          res.writeHead(400).end(JSON.stringify({ error: { message: "This conversation has reached 100 model turns" } })); return;
+        }
+        sessionTurns.set(sessionId, turns + 1);
+      }
+      if (Array.isArray(body.input) && body.input.filter((i) => i.role === "assistant" || ["function_call", "custom_tool_call"].includes(i.type)).length >= modelTurnLimit) {
+        res.writeHead(400).end(JSON.stringify({ error: { message: "This conversation has reached 100 model turns" } })); return;
+      }
       if (body.input?.at(-1)?.type === "compaction_trigger") {
-        compactions.push(body);
+        compactions.push({ ...body, userAgent: req.headers["user-agent"], sessionId, headers: { ...req.headers } });
         if (delayCompaction) await new Promise((r) => setTimeout(r, delayCompaction));
-        if (failCompaction) { res.writeHead(503).end("{}"); return; }
-        res.end(JSON.stringify({ id: `resp_internal_${++counter}`, status: "completed", output: [{ type: "compaction", id: `cmp_${counter}`, encrypted_content: "sealed-prefix" }] })); return;
+        if (failCompaction) { res.writeHead(503).end(JSON.stringify({ error: { code: "trigger_down", message: "trigger unavailable" } })); return; }
+        assert.equal(body.stream, true, "native compaction uses the verified streaming protocol");
+        const reply = { id: `resp_internal_${++counter}`, status: "completed", output: [{ type: "compaction", id: `cmp_${counter}`, encrypted_content: "sealed-prefix" }] };
+        res.setHeader("content-type", "text/event-stream");
+        const item = `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: reply.output[0] })}\r\n\r\n`;
+        res.write(item.slice(0, 13)); res.write(item.slice(13));
+        // Exercise item recovery when the terminal response omits its output.
+        res.end(`data: ${JSON.stringify({ type: "response.completed", response: { ...reply, output: [] } })}\r\n\r\ndata: [DONE]\r\n\r\n`); return;
+      }
+      if (body.input?.[0]?.role === "system" && body.input[0].content?.startsWith("Summarize the historical conversation for continuation.")) {
+        summaries.push({ body, sessionId, authorization: req.headers.authorization, userAgent: req.headers["user-agent"] });
+        if (failSummary) { res.writeHead(503).end(JSON.stringify({ error: { code: "summary_down", message: summaryFailure } })); return; }
+        res.setHeader("content-type", "text/event-stream");
+        res.end(`data: ${JSON.stringify({ type: "response.completed", response: { id: `summary_${++counter}`, status: "completed", output: [
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "Historical task summary." }] },
+        ] } })}\n\n`); return;
       }
       const incoming = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input ?? [];
       const conversation = typeof body.conversation === "string" ? body.conversation : body.conversation?.id;
@@ -55,8 +106,8 @@ async function fixture(t, policy = {}, fetchImpl) {
       if (body.previous_response_id && !previous) { res.writeHead(404).end("{}"); return; }
       const base = conversation ? conversations.get(conversation) : previous?.history ?? [];
       if (!base) { res.writeHead(404).end("{}"); return; }
-      calls.push({ body, authorization: req.headers.authorization, history: [...base, ...incoming] });
-      if (body.metadata?.reject) { res.writeHead(400).end(JSON.stringify({ error: { message: "deliberate request rejection" } })); return; }
+      calls.push({ body, authorization: req.headers.authorization, userAgent: req.headers["user-agent"], sessionId, headers: { ...req.headers }, history: [...base, ...incoming] });
+      if (body.metadata?.reject) { res.writeHead(typeof body.metadata.reject === "number" ? body.metadata.reject : 400).end(JSON.stringify({ error: { message: "deliberate request rejection" } })); return; }
       if (body.metadata?.delay) await new Promise((r) => setTimeout(r, body.metadata.delay));
       const id = `resp_${++counter}`;
       const output = body.metadata?.tool ? [{ type: "function_call", id: `fc_${counter}`, call_id: "active_call", name: "read", arguments: "{}" }]
@@ -81,14 +132,14 @@ async function fixture(t, policy = {}, fetchImpl) {
   upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
   const upstreamURL = `http://127.0.0.1:${upstream.address().port}/v1/responses`;
   const options = { providers: { limited: {
-    maxMessages: 4, maxTurns: 2, keepTurns: 1, mode: "responses", ...policy,
-    ...(policy.mode === "summary" && !policy.summary ? { summary: { url: upstreamURL.replace("/v1/responses", "/summarize"), model: "small" } } : {}),
+    maxMessages: 4, ...policy,
     stateful: { enabled: true, url: upstreamURL, ...policy.stateful },
   } } };
-  let proxy = await createSessionTransport(options, { stateDir: root, fetchImpl });
-  async function request(body, { key = "tenant-a", path = "/responses", method = "POST", signal } = {}) {
+  const summaryProviders = { "summary-fixture": { protocol: "chat", baseURL: upstreamURL.replace("/v1/responses", "/summary-api/v1"), key: "separate-summary-key", models: ["small"] } };
+  let proxy = await createSessionTransport(options, { stateDir: root, fetchImpl, summaryProviders });
+  async function request(body, { key = "tenant-a", path = "/responses", method = "POST", signal, headers = {} } = {}) {
     return proxy.fetch("limited", `${upstreamURL.replace(/\/responses$/, "")}${path}`, {
-      method, signal, headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      method, signal, headers: { ...headers, authorization: `Bearer ${key}`, "content-type": "application/json" },
       body: method === "GET" ? undefined : JSON.stringify({ model: "test", ...body }),
     });
   }
@@ -100,13 +151,77 @@ async function fixture(t, policy = {}, fetchImpl) {
     await proxy.close(); await new Promise((r) => upstream.close(r)); await rm(root, { recursive: true, force: true });
   });
   return {
-    root, upstreamURL, calls, compactions, summaries, conversations, responses, request, turn,
+    root, upstreamURL, calls, compactions, compactEndpoints, alphaSearches, summaries, conversations, responses, request, turn, sessionTurns, managementCalls,
     failCompaction() { failCompaction = true; },
+    failCompactEndpoint() { failCompactEndpoint = true; },
+    failSummary(message) { failSummary = true; if (message) summaryFailure = message; },
+    setModelTurnLimit(n) { modelTurnLimit = n; },
+    setSessionTurnLimit(n) { sessionTurnLimit = n; },
     delayCompaction(ms) { delayCompaction = ms; },
-    async restart() { await proxy.close(); proxy = await createSessionTransport(options, { stateDir: root, fetchImpl }); },
-    async secondOwner() { return createSessionTransport(options, { stateDir: root }); },
+    async restart() { await proxy.close(); proxy = await createSessionTransport(options, { stateDir: root, fetchImpl, summaryProviders }); },
+    async secondOwner(overrides = {}) {
+      return createSessionTransport({ providers: { limited: { ...options.providers.limited, ...overrides } } }, { stateDir: root, summaryProviders });
+    },
   };
 }
+
+for (const stream of [false, true]) {
+  test(`compaction notice persists a local response and resumes after restart (stream=${stream})`, async (t) => {
+    const f = await fixture(t, { maxMessages: 8, compactionNotice: true, stateful: { maxRequests: 1 } });
+    const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
+    const response = await f.request({ input, stream });
+    assert.equal(response.status, 200);
+    let reply;
+    if (stream) {
+      const events = (await response.text()).split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+      assert.equal(events[0].type, "response.created");
+      assert.equal(events.at(-1).type, "response.completed");
+      assert.equal(events.find((event) => event.type === "response.output_text.delta").delta, "上下文已压缩，请继续。");
+      reply = events.at(-1).response;
+    } else reply = await response.json();
+    assert.equal(reply.output[0].content[0].text, "上下文已压缩，请继续。");
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.compactions.length, 1);
+    await f.restart();
+    const retrieved = await f.request(undefined, { path: `/responses/${reply.id}`, method: "GET" });
+    assert.deepEqual(await retrieved.json(), reply);
+    const next = await f.turn({ previous_response_id: reply.id, input: "continue" });
+    assert.equal(next.previous_response_id, reply.id);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].body.previous_response_id, undefined);
+    assert.equal(f.calls[0].sessionId, undefined);
+    assert.equal(f.calls[0].body.input[0].type, "compaction");
+    assert.match(JSON.stringify(f.calls[0].body.input), /上下文已压缩/);
+  });
+}
+
+test("Responses compaction notice also returns after pack fallback without inference", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Packed" });
+  f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
+  const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
+  const reply = await f.turn({ input, store: false });
+  assert.equal(reply.output[0].content[0].text, "Packed");
+  assert.equal(f.calls.length, 0);
+  await f.restart();
+  await f.turn({ input: [...input, { role: "assistant", content: "Packed" }, { role: "user", content: "continue" }], store: false });
+  assert.equal(f.calls.length, 1);
+  assert.match(f.calls[0].body.input[0].content, /original_messages_json/);
+});
+
+test("conversation compaction notice updates the shadow before returning", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Ready to continue" });
+  f.conversations.set("conv_notice", Array.from({ length: 8 }, (_, index) => ({ id: `item_notice_${index}`, role: index % 2 ? "assistant" : "user", content: `turn ${index}` })));
+  const reply = await f.turn({ conversation: "conv_notice", input: "new task" });
+  assert.equal(reply.output[0].content[0].text, "Ready to continue");
+  assert.equal(f.calls.length, 0);
+  await f.restart();
+  await f.turn({ conversation: "conv_notice", input: "continue" });
+  assert.equal(f.calls.length, 1);
+  const history = f.conversations.get(f.calls[0].body.conversation);
+  assert.equal(history[0].type, "compaction");
+  assert.match(JSON.stringify(history), /new task/);
+  assert.match(JSON.stringify(history), /Ready to continue/);
+});
 
 test("previous_response_id creates a fresh compacted chain and echoes the client's parent", async (t) => {
   const f = await fixture(t);
@@ -115,6 +230,8 @@ test("previous_response_id creates a fresh compacted chain and echoes the client
   const c = await f.turn({ input: "third", previous_response_id: b.id, instructions: "preserve", tools: [{ type: "function", name: "read", parameters: {} }] });
   assert.equal(c.previous_response_id, b.id);
   assert.equal(f.compactions.length, 1);
+  assert.equal(f.compactEndpoints.length, 0);
+  assert.equal(f.summaries.length, 0);
   assert.equal(f.calls.at(-1).body.previous_response_id, undefined);
   assert.equal(f.calls.at(-1).body.input[0].type, "compaction");
   assert.equal(f.calls.at(-1).body.instructions, "preserve");
@@ -126,13 +243,14 @@ test("previous_response_id creates a fresh compacted chain and echoes the client
   assert.equal((await retrieved.json()).previous_response_id, b.id);
 });
 
-test("server chain request counts can trigger compaction independently of user/message counts", async (t) => {
-  const f = await fixture(t, { maxMessages: 100, maxTurns: 100, stateful: { maxRequests: 2 } });
+test("server chain request counts rotate IDs without compaction", async (t) => {
+  const f = await fixture(t, { maxMessages: 100, stateful: { maxRequests: 2 } });
   const a = await f.turn({ input: "first" });
   const b = await f.turn({ input: "second", previous_response_id: a.id });
   await f.turn({ input: "third", previous_response_id: b.id });
-  assert.equal(f.compactions.length, 1);
-  assert.equal(f.calls.at(-1).body.previous_response_id, undefined);
+  assert.equal(f.compactions.length, 0);
+  assert.equal(f.calls.at(-1).body.previous_response_id, b.id);
+  assert.match(f.calls.at(-1).sessionId, /^[0-9a-f-]{36}$/);
 });
 
 test("response snapshots survive a provider restart and isolate credentials", async (t) => {
@@ -148,13 +266,13 @@ test("response snapshots survive a provider restart and isolate credentials", as
   const files = (await readdir(f.root)).filter((x) => x.endsWith(".json"));
   assert.ok(files.length >= 3);
   for (const file of files) {
-    assert.equal((await stat(join(f.root, file))).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(join(f.root, file))).mode & 0o777, 0o600);
     assert.doesNotMatch(await readFile(join(f.root, file), "utf8"), /Bearer tenant-a/);
   }
 });
 
 test("immutable response snapshots preserve branches from the same parent", async (t) => {
-  const f = await fixture(t, { maxMessages: 100, maxTurns: 100 });
+  const f = await fixture(t, { maxMessages: 100 });
   const parent = await f.turn({ input: "root" });
   const [left, right] = await Promise.all([
     f.turn({ previous_response_id: parent.id, input: "left branch" }),
@@ -232,12 +350,13 @@ test("truncated streams recover by retrieving the actual upstream response, with
   assert.equal(next.conversation.id, "conv_client");
 });
 
-test("pack handles server-side history without a model endpoint; failed native compaction falls back safely", async (t) => {
-  const f = await fixture(t, { mode: "pack" });
+test("pack is last fallback; a failed trigger uses the standalone compact endpoint", async (t) => {
+  const f = await fixture(t); f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
   const a = await f.turn({ input: "first" });
   const b = await f.turn({ input: "second", previous_response_id: a.id });
   await f.turn({ input: "third", previous_response_id: b.id });
-  assert.equal(f.compactions.length, 0);
+  assert.equal(f.compactions.length, 1);
+  assert.equal(f.summaries.length, 1);
   assert.match(JSON.stringify(f.calls.at(-1).body.input), /original_messages_json/);
   const native = await fixture(t);
   native.failCompaction();
@@ -245,7 +364,85 @@ test("pack handles server-side history without a model endpoint; failed native c
   const n2 = await native.turn({ input: "second", previous_response_id: n1.id });
   await native.turn({ input: "third", previous_response_id: n2.id });
   assert.equal(native.compactions.length, 1);
-  assert.match(JSON.stringify(native.calls.at(-1).body.input), /original_messages_json/);
+  assert.equal(native.compactEndpoints.length, 1);
+  assert.equal(native.summaries.length, 0);
+  assert.ok(native.calls.at(-1).body.input.some((x) => x.encrypted_content === "sealed-endpoint-prefix"));
+  assert.ok(native.calls.at(-1).body.input.some((x) => x.content === "Preserved by standalone compact endpoint."));
+});
+
+test("both native failures use a same-provider summary without changing session identity", async (t) => {
+  const f = await fixture(t);
+  f.failCompaction(); f.failCompactEndpoint();
+  const opts = { headers: { "session-id": "old-summary-session", "user-agent": "Codex test UA" } };
+  await f.turn({ input: loopHistory(), prompt_cache_key: "old-summary-session", store: false }, opts);
+  assert.equal(f.compactions.length, 1); assert.equal(f.compactEndpoints.length, 1); assert.equal(f.summaries.length, 1);
+  const summary = f.summaries[0], generation = f.compactions[0].sessionId;
+  assert.equal(generation, "old-summary-session");
+  assert.equal(f.compactEndpoints[0].sessionId, generation);
+  assert.equal(summary.sessionId, generation); assert.equal(summary.body.prompt_cache_key, generation);
+  assert.equal(summary.authorization, "Bearer tenant-a"); assert.equal(summary.userAgent, "Codex test UA");
+  assert.equal(summary.body.model, "test");
+  assert.match(JSON.stringify(f.calls.at(-1).body.input), /Historical task summary/);
+  assert.doesNotMatch(JSON.stringify(f.calls.at(-1).body.input), /original_messages_json/);
+  await f.restart();
+  await f.turn({ input: "continue", prompt_cache_key: "old-summary-session", store: false }, opts);
+  assert.equal(f.calls.at(-1).sessionId, generation);
+});
+
+test("Responses summary fallback honors an external summarizer and isolates its credentials", async (t) => {
+  const f = await fixture(t, { summary: { provider: "summary-fixture", model: "small" } });
+  f.failCompaction(); f.failCompactEndpoint();
+  await f.turn({ input: loopHistory(), store: false });
+  assert.equal(f.summaries[0].authorization, "Bearer separate-summary-key");
+  assert.equal(f.summaries[0].body.model, "small");
+  assert.equal(f.calls.at(-1).authorization, "Bearer tenant-a");
+});
+
+test("external summary errors redact the target credential and preserve pack fallback", async (t) => {
+  for (const enablePack of [false, true]) {
+    const f = await fixture(t, { enablePack, summary: { provider: "summary-fixture" } });
+    f.failCompaction(); f.failCompactEndpoint(); f.failSummary("service rejected separate-summary-key");
+    const response = await f.request({ input: loopHistory(), store: false });
+    const text = await response.text();
+    assert.doesNotMatch(text, /separate-summary-key/);
+    assert.equal(response.status, enablePack ? 200 : 422, text);
+    if (!enablePack) assert.equal(JSON.parse(text).error.attempts.at(-1).method, "summary");
+    else assert.match(JSON.stringify(f.calls.at(-1).body.input), /original_messages_json/);
+  }
+});
+
+test("all failed compaction methods return explicit sanitized errors without inference or durable mapping", async (t) => {
+  const f = await fixture(t, { enablePack: false });
+  f.failCompaction(); f.failCompactEndpoint(); f.failSummary("summary unavailable; Bearer tenant-a; sk-test-secret");
+  const opts = { headers: { "session-id": "failed-session" } };
+  const response = await f.request({ input: loopHistory(), prompt_cache_key: "failed-session", store: false }, opts);
+  assert.equal(response.status, 422);
+  const text = await response.text(), { error } = JSON.parse(text);
+  assert.equal(error.code, "compaction_failed");
+  assert.deepEqual(error.attempts.map((a) => [a.method, a.status]), [["compaction_trigger", 503], ["/responses/compact", 429], ["summary", 503]]);
+  assert.match(error.message, /trigger unavailable/); assert.match(error.message, /compact endpoint unavailable/); assert.match(error.message, /summary unavailable/);
+  assert.doesNotMatch(text, /tenant-a|sk-test-secret/);
+  assert.equal(f.calls.length, 0);
+  await f.restart();
+  await f.turn({ input: "small retry", prompt_cache_key: "failed-session", store: false }, opts);
+  assert.equal(f.calls.at(-1).sessionId, "failed-session");
+});
+
+test("a failed conversation compaction leaves no pending journal or shadow alias", async (t) => {
+  const f = await fixture(t, { enablePack: false });
+  const first = await f.turn({ conversation: "conv_client", input: "first" });
+  await f.turn({ conversation: "conv_client", input: "second" });
+  f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
+  const response = await f.request({ conversation: "conv_client", input: "third" });
+  assert.equal(response.status, 422);
+  assert.equal((await response.json()).error.code, "compaction_failed");
+  assert.equal(f.calls.length, 2); assert.equal(f.conversations.size, 1);
+  await f.restart();
+  const result = await f.request(undefined, { path: `/responses/${first.id}`, method: "GET" });
+  assert.equal(result.status, 200);
+  const again = await f.request({ conversation: "conv_client", input: "retry third" });
+  assert.equal(again.status, 422);
+  assert.equal((await again.json()).error.code, "compaction_failed", "Failure must not become an ambiguous-conversation error");
 });
 
 test("pending function calls and current outputs stay together when resetting a chain", async (t) => {
@@ -283,18 +480,18 @@ test("overlapping provider hosts serialize the same conversation using shared du
 });
 
 test("model summaries work for server chains without leaking inference credentials", async (t) => {
-  const f = await fixture(t, { mode: "summary" });
+  const f = await fixture(t, { summary: { provider: "summary-fixture", model: "small" } }); f.failCompaction(); f.failCompactEndpoint();
   const a = await f.turn({ input: "first" });
   const b = await f.turn({ input: "second", previous_response_id: a.id });
   await f.turn({ input: "third", previous_response_id: b.id });
   assert.equal(f.summaries.length, 1);
-  assert.equal(f.summaries[0].authorization, undefined);
+  assert.equal(f.summaries[0].authorization, "Bearer separate-summary-key");
   assert.match(JSON.stringify(f.calls.at(-1).body.input), /Historical task summary/);
   assert.equal(f.calls.at(-1).authorization, "Bearer tenant-a");
 });
 
 test("failed inference after pack rotation leaves the old conversation mapping intact", async (t) => {
-  const f = await fixture(t, { mode: "pack" });
+  const f = await fixture(t); f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
   await f.turn({ conversation: "conv_client", input: "first" });
   await f.turn({ conversation: "conv_client", input: "second" });
   const rejected = await f.request({ conversation: "conv_client", input: "rejected third", metadata: { reject: true } });
@@ -311,11 +508,26 @@ test("ambiguous conversation attempts remain blocked across restart rather than 
   const f = await fixture(t);
   const first = await f.request({ conversation: "conv_client", input: "first", metadata: { breakBeforeID: true } });
   assert.equal(first.status, 502);
+  assert.equal(f.calls.length, 1, "upstream received the request before its connection was lost");
   await f.restart();
   const next = await f.request({ conversation: "conv_client", input: "next" });
   assert.equal(next.status, 409);
   assert.equal((await next.json()).error.code, "ambiguous_conversation_request");
   assert.equal(f.calls.length, 1);
+});
+
+test("upstream gateway errors retain the ambiguous conversation journal across restart", async (t) => {
+  for (const status of [502, 408]) {
+    const f = await fixture(t);
+    const failed = await f.request({ conversation: "conv_client", input: "first", metadata: { reject: status } });
+    assert.equal(failed.status, status);
+    await failed.text();
+    await f.restart();
+    const next = await f.request({ conversation: "conv_client", input: "retry" });
+    assert.equal(next.status, 409);
+    assert.equal((await next.json()).error.code, "ambiguous_conversation_request");
+    assert.equal(f.calls.length, 1);
+  }
 });
 
 test("background execution is rejected explicitly, and store:false responses have no durable chain", async (t) => {
@@ -327,18 +539,19 @@ test("background execution is rejected explicitly, and store:false responses hav
   assert.equal(f.calls.length, 1);
 });
 
-test("native compaction timeout leaves time to run the actual request using the pack fallback", async (t) => {
+test("native trigger timeout leaves time to try standalone compact and inference", async (t) => {
   const f = await fixture(t, { responses: { timeoutMs: 20 } });
   f.delayCompaction(100);
   const a = await f.turn({ input: "first" });
   const b = await f.turn({ input: "second", previous_response_id: a.id });
   const c = await f.turn({ input: "third", previous_response_id: b.id });
   assert.equal(c.previous_response_id, b.id);
-  assert.match(JSON.stringify(f.calls.at(-1).body.input), /original_messages_json/);
+  assert.equal(f.compactEndpoints.length, 1);
+  assert.ok(f.calls.at(-1).body.input.some((x) => x.type === "compaction"));
 });
 
 test("native chain resets replay developer messages from the compacted history", async (t) => {
-  const f = await fixture(t, { maxMessages: 6 });
+  const f = await fixture(t, { maxMessages: 5 });
   const a = await f.turn({ input: [{ role: "user", content: "first" }, { role: "developer", content: "Keep this developer constraint." }] });
   const b = await f.turn({ input: "second", previous_response_id: a.id });
   await f.turn({ input: "third", previous_response_id: b.id });
@@ -372,4 +585,393 @@ test("aborting an unconsumed stream releases its session lock", async (t) => {
   const next = await f.request({ conversation: "conv_client", input: "second" });
   // If no response.created reached the journal, the outcome stays ambiguous.
   assert.ok([200, 409].includes(next.status)); await next.text();
+});
+
+function loopHistory(n = 8) {
+  return [{ role: "user", content: "Finish the coding task." }, ...Array.from({ length: n }, (_, i) => [
+    { type: "function_call", call_id: `call_${i}`, name: "read", arguments: "{}" },
+    { type: "function_call_output", call_id: `call_${i}`, output: `result ${i}` },
+  ]).flat()];
+}
+
+test("full-history Codex tool loops continue beyond 100 model turns with bounded native requests", async (t) => {
+  const f = await fixture(t, { maxMessages: 80 });
+  f.setModelTurnLimit(100);
+  const input = [{ role: "user", content: "Finish the coding task." }];
+  for (let i = 0; i < 130; i++) {
+    const reply = await f.turn({ input, store: false, metadata: { tool: true } });
+    assert.ok(f.calls.at(-1).body.input.length <= 80);
+    input.push(...reply.output, { type: "function_call_output", call_id: "active_call", output: `step ${i}` });
+  }
+  assert.equal(f.calls.length, 130);
+  assert.ok(f.compactions.length >= 2 && f.compactions.length < 8);
+  assert.ok(f.compactions.slice(1).every((p) => p.input.some((i) => i.type === "compaction")));
+  assert.ok(f.calls.every((call) => call.sessionId === undefined));
+  assert.ok(f.compactions.every((call) => call.sessionId === undefined));
+});
+
+test("streamed stateless compaction survives restart and SDK envelope normalization", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  const input = loopHistory();
+  const response = await f.request({ input, store: false, stream: true });
+  const stream = await response.text();
+  assert.match(stream, /response.completed/);
+  const initial = f.compactions.length;
+  await f.restart();
+  // The SDK echoes the same semantic input with optional envelope fields.
+  const replay = input.map((i, n) => ({ ...i, id: `sdk_${n}`, status: "completed" }));
+  replay.push({ role: "assistant", content: "finished batch" }, { role: "user", content: "Continue." });
+  await f.turn({ input: replay, store: false });
+  assert.equal(f.compactions.length, initial, "reuses the existing compacted prefix");
+  assert.equal(f.calls.at(-1).body.input[0].type, "compaction");
+  assert.deepEqual(f.calls.at(-1).body.input.slice(-2), replay.slice(-2));
+});
+
+test("stateless cached compaction is isolated by credentials, model, configuration and changed input", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  const input = loopHistory();
+  await f.turn({ input, store: false });
+  for (const [body, opts] of [
+    [{}, { key: "tenant-b" }], [{ model: "other" }, {}], [{ instructions: "new constraints" }, {}],
+    [{ input: [{ ...input[0], content: "A different task." }, ...input.slice(1)] }, {}],
+  ]) {
+    const before = f.compactions.length;
+    await f.turn({ input, store: false, ...body }, opts);
+    assert.equal(f.compactions.length, before + 1, "must not reuse a mismatched cache entry");
+    assert.equal(f.compactions.at(-1).input.some((i) => i.type === "compaction"), false);
+  }
+});
+
+test("Codex TUI user agent reaches both native compaction and inference", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  const ua = "codex_cli_rs/0.172.0 (Windows; x86_64) WindowsTerminal";
+  await f.turn({ input: loopHistory(), store: false }, { headers: { "user-agent": ua } });
+  assert.equal(f.compactions.at(-1).userAgent, ua);
+  assert.equal(f.calls.at(-1).userAgent, ua);
+});
+
+test("changing pack configuration does not reuse a cache under a different policy", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  const input = loopHistory();
+  await f.turn({ input, store: false });
+  f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
+  const packed = await f.secondOwner({ enablePack: false, maxMessages: 8 });
+  t.after(() => packed.close());
+  const response = await packed.fetch("limited", f.upstreamURL, {
+    method: "POST", headers: { authorization: "Bearer tenant-a", "content-type": "application/json" },
+    body: JSON.stringify({ model: "test", input, store: false }),
+  });
+  assert.equal(response.status, 422);
+  assert.equal((await response.json()).error.code, "compaction_failed");
+  assert.equal(f.compactions.length, 2);
+});
+
+test("an oversized protected current batch returns an explicit compaction failure", async (t) => {
+  const f = await fixture(t, { maxMessages: 4 });
+  const input = loopHistory();
+  const response = await f.request({ conversation: "conv_client", input });
+  assert.equal(response.status, 422);
+  const { error } = await response.json();
+  assert.equal(error.code, "compaction_failed");
+  assert.equal(error.attempts.length, 4);
+  assert.ok(error.attempts.every((a) => a.code === "no_safe_cut"));
+  assert.equal(f.compactions.length, 0);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.conversations.size, 1, "No shadow conversation is created on failure");
+});
+
+test("mapped request replaces session markers together while preserving payloads and request IDs", () => {
+  const headers = new Headers({ "session-id": "old", session_id: "old", "thread-id": "old", "x-session-id": "old",
+    "x-codex-turn-state": "old-sticky-state", "x-client-request-id": "request-123", authorization: "Bearer tenant-a" });
+  const body = { prompt_cache_key: "old", session_id: "old", conversation_id: "old", metadata: { session_id: "old", other: "preserve" },
+    input: [{ role: "user", content: "Keep the actual task." }], previous_response_id: "resp_actual" };
+  const original = structuredClone(body);
+  const result = mappedRequest(headers, body, "new-generation");
+  for (const name of ["session-id", "session_id", "thread-id", "x-session-id"]) assert.equal(result.headers.get(name), "new-generation");
+  assert.equal(result.headers.has("x-codex-turn-state"), false);
+  assert.equal(result.headers.get("x-client-request-id"), "request-123");
+  assert.equal(result.headers.get("authorization"), "Bearer tenant-a");
+  assert.equal(result.payload.prompt_cache_key, "new-generation");
+  assert.equal(result.payload.metadata.session_id, "new-generation");
+  assert.equal(result.payload.metadata.other, "preserve");
+  assert.equal(result.payload.previous_response_id, "resp_actual");
+  assert.deepEqual(body, original);
+  assert.equal(headers.get("session-id"), "old");
+  assert.equal(clientSessionKey(new Headers({ "session-id": "old" }), { model: "test", prompt_cache_key: "old" }),
+    clientSessionKey(new Headers({ session_id: "old", "thread-id": "old" }), { model: "test", prompt_cache_key: "old" }));
+});
+
+test("request limits alone rotate persistent generations; compaction does not reset the count", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, stateful: { maxRequests: 2 } });
+  const originalId = "codex-client-session";
+  const opts = { headers: { "session-id": originalId, session_id: originalId, "thread-id": originalId,
+    "x-codex-turn-state": "old-route", "x-client-request-id": "preserve-this-request-id" } };
+  const input = loopHistory(), generations = [];
+  for (let i = 0; i < 8; i++) {
+    const reply = await f.turn({ input, prompt_cache_key: originalId, store: false }, opts);
+    const call = f.calls.at(-1);
+    if (i < 2) {
+      assert.equal(call.sessionId, originalId);
+      assert.equal(call.headers["x-codex-turn-state"], "old-route");
+    } else {
+      assert.match(call.sessionId, /^[0-9a-f-]{36}$/);
+      assert.equal(call.headers["x-codex-turn-state"], undefined);
+    }
+    assert.equal(call.body.prompt_cache_key, call.sessionId);
+    assert.equal(call.headers.session_id, call.sessionId);
+    assert.equal(call.headers["thread-id"], call.sessionId);
+    assert.equal(call.headers["x-client-request-id"], "preserve-this-request-id");
+    if (i % 2 === 1) assert.equal(call.sessionId, generations.at(-1));
+    else if (i > 0) assert.notEqual(call.sessionId, generations.at(-1));
+    generations.push(call.sessionId);
+    input.push(...reply.output, { role: "user", content: `Continue step ${i}.` });
+    await f.restart();
+  }
+  assert.equal(new Set(generations).size, 4);
+  assert.ok(f.compactions.length > 1);
+});
+
+test("identical histories in different client sessions or tenants receive distinct mappings", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, stateful: { maxRequests: 1 } });
+  const input = loopHistory();
+  const ids = [];
+  for (const [client, key] of [["client-a", "tenant-a"], ["client-b", "tenant-a"], ["client-a", "tenant-b"]]) {
+    await f.turn({ input: "prime", prompt_cache_key: client, store: false }, { key, headers: { "session-id": client } });
+    await f.turn({ input, prompt_cache_key: client, store: false }, { key, headers: { "session-id": client } });
+    ids.push(f.calls.at(-1).sessionId);
+  }
+  assert.equal(new Set(ids).size, 3);
+  const calls = f.compactions.length;
+  await f.restart();
+  await f.turn({ input, prompt_cache_key: "client-a", store: false }, { headers: { "session-id": "client-a" } });
+  assert.notEqual(f.calls.at(-1).sessionId, ids[0]);
+  assert.equal(f.compactions.length, calls);
+});
+
+test("a failed compressed inference does not publish its tentative session mapping", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, stateful: { maxRequests: 1 } });
+  const opts = { headers: { "session-id": "client-original" } };
+  await f.turn({ input: "prime", prompt_cache_key: "client-original", store: false }, opts);
+  const failed = await f.request({ input: loopHistory(), prompt_cache_key: "client-original", store: false, metadata: { reject: true } }, opts);
+  assert.equal(failed.status, 400);
+  await failed.text();
+  assert.notEqual(f.calls.at(-1).sessionId, "client-original");
+  await f.restart();
+  await f.turn({ input: "uncompressed retry", prompt_cache_key: "client-original", store: false }, opts);
+  assert.notEqual(f.calls.at(-1).sessionId, "client-original");
+  assert.notEqual(f.calls.at(-1).sessionId, f.calls.at(-2).sessionId);
+  assert.equal(f.calls.at(-1).body.prompt_cache_key, f.calls.at(-1).sessionId);
+});
+
+test("failure of both native methods with opaque history errors without publishing a session mapping", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  f.failCompaction();
+  f.failCompactEndpoint();
+  const input = loopHistory();
+  input.splice(1, 0, { type: "reasoning", encrypted_content: "opaque" });
+  const response = await f.request({ input, prompt_cache_key: "client-original", store: false }, { headers: { "session-id": "client-original", "x-codex-turn-state": "old-route" } });
+  assert.equal(response.status, 422);
+  const { error } = await response.json();
+  assert.equal(error.code, "compaction_failed");
+  assert.equal(error.attempts.at(-1).code, "no_safe_cut");
+  assert.equal(f.compactions.at(-1).sessionId, "client-original");
+  assert.equal(f.compactEndpoints.at(-1).sessionId, f.compactions.at(-1).sessionId);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.summaries.length, 0, "Opaque history must never be sent for a lossy summary");
+  await f.turn({ input: "small retry", prompt_cache_key: "client-original", store: false }, { headers: { "session-id": "client-original" } });
+  assert.equal(f.calls.at(-1).sessionId, "client-original");
+});
+
+test("response-chain rotation keeps the mapped session for continuation and response retrieval", async (t) => {
+  const f = await fixture(t, { stateful: { maxRequests: 2 } });
+  const opts = { headers: { "session-id": "original-response-session" } };
+  const a = await f.turn({ input: "first" }, opts);
+  const b = await f.turn({ input: "second", previous_response_id: a.id }, opts);
+  const c = await f.turn({ input: "third", previous_response_id: b.id }, opts);
+  const mapped = f.calls.at(-1).sessionId;
+  assert.notEqual(mapped, "original-response-session");
+  assert.equal(c.previous_response_id, b.id);
+  await f.restart();
+  const retrieved = await f.request({}, { ...opts, path: `/responses/${c.id}`, method: "GET" });
+  assert.equal(retrieved.status, 200);
+  assert.equal((await retrieved.json()).id, c.id);
+  assert.equal(f.managementCalls.at(-1).sessionId, mapped);
+  await f.turn({ input: "fourth", previous_response_id: c.id }, opts);
+  assert.equal(f.calls.at(-1).sessionId, mapped);
+});
+
+test("truncated conversation recovery uses the pending generation's ID rather than the old alias", async (t) => {
+  const f = await fixture(t, { stateful: { maxRequests: 2 } });
+  const opts = { headers: { "session-id": "original-conversation-session" } };
+  await f.turn({ conversation: "conv_client", input: "first" }, opts);
+  await f.turn({ conversation: "conv_client", input: "second" }, opts);
+  const response = await f.request({ conversation: "conv_client", input: "third", stream: true, metadata: { truncate: true } }, opts);
+  await assert.rejects(() => response.text());
+  const mapped = f.calls.at(-1).sessionId;
+  assert.notEqual(mapped, "original-conversation-session");
+  await f.restart();
+  const reply = await f.turn({ conversation: "conv_client", input: "fourth" }, opts);
+  assert.equal(reply.conversation.id, "conv_client");
+  assert.equal(f.managementCalls.at(-1).sessionId, mapped);
+  assert.equal(f.calls.at(-1).sessionId, mapped);
+});
+
+
+test("Responses no-control passthrough preserves raw JSON and SSE and ignores retired thresholds", async (t) => {
+  const seen = [];
+  const rawSSE = 'event: custom\ndata: {"untouched":true}\n\n';
+  const f = await fixture(t, { maxMessages: undefined, mode: "responses", maxTurns: 1, keepTurns: 1, stateful: { maxRequests: 0 } }, async (_url, init) => {
+    seen.push({ body: init.body, headers: new Headers(init.headers) });
+    return new Response(rawSSE, { headers: { "content-type": "text/event-stream" } });
+  });
+  const body = { input: loopHistory(), previous_response_id: "unknown-upstream-id", prompt_cache_key: "client", store: false };
+  for (let i = 0; i < 2; i++) {
+    const response = await f.request(body, { headers: { "session-id": "client", "x-codex-turn-state": "sticky" } });
+    assert.equal(response.status, 200); assert.equal(await response.text(), rawSSE);
+    assert.deepEqual(JSON.parse(seen.at(-1).body), { model: "test", ...body });
+    assert.equal(seen.at(-1).headers.get("session-id"), "client");
+    assert.equal(seen.at(-1).headers.get("x-codex-turn-state"), "sticky");
+    await f.restart();
+  }
+});
+
+test("Responses rotation only never compacts, accepts existing upstream response chains and survives restart", async (t) => {
+  const f = await fixture(t, { maxMessages: undefined, stateful: { maxRequests: 1 } });
+  // An upstream response created before this transport started is valid when
+  // no history-based compression has been requested.
+  f.responses.set("resp_existing", { history: [{ role: "user", content: "remote context" }], reply: {} });
+  const opts = { headers: { "session-id": "rotation-client" } };
+  const input = loopHistory();
+  let previous = "resp_existing";
+  const ids = [];
+  for (let i = 0; i < 4; i++) {
+    const reply = await f.turn({ input, previous_response_id: previous }, opts);
+    assert.equal(f.calls.at(-1).body.previous_response_id, previous);
+    assert.deepEqual(f.calls.at(-1).body.input, input);
+    ids.push(f.calls.at(-1).sessionId); previous = reply.id;
+    await f.restart();
+  }
+  assert.equal(ids[0], "rotation-client"); assert.equal(new Set(ids).size, 4);
+  assert.equal(f.compactions.length, 0); assert.equal(f.compactEndpoints.length, 0); assert.equal(f.summaries.length, 0);
+  const compressing = await f.secondOwner({ maxMessages: 8 }); t.after(() => compressing.close());
+  const unsafe = await compressing.fetch("limited", f.upstreamURL, { method: "POST", headers: { authorization: "Bearer tenant-a" }, body: JSON.stringify({ model: "test", previous_response_id: previous, input: "continue" }) });
+  assert.equal(unsafe.status, 409); assert.equal((await unsafe.json()).error.code, "unknown_response_chain");
+});
+
+test("unsetting maxRequests ignores prior mappings even when compression or prefix replay runs", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, stateful: { maxRequests: 1 } });
+  const body = { input: loopHistory(), prompt_cache_key: "original-client", store: false };
+  const headers = { authorization: "Bearer tenant-a", "session-id": "original-client", "content-type": "application/json" };
+  await f.turn({ input: "prime", prompt_cache_key: "original-client", store: false }, { headers });
+  await f.turn(body, { headers }); assert.notEqual(f.calls.at(-1).sessionId, "original-client");
+  for (const maxMessages of [undefined, 8]) {
+    const noRotation = await f.secondOwner({ maxMessages, stateful: { enabled: true, url: f.upstreamURL } });
+    try {
+      const response = await noRotation.fetch("limited", f.upstreamURL, { method: "POST", headers, body: JSON.stringify({ model: "test", ...body }) });
+      assert.equal(response.status, 200); await response.json();
+      assert.equal(f.calls.at(-1).sessionId, "original-client");
+      assert.equal(f.calls.at(-1).body.prompt_cache_key, "original-client");
+    } finally { await noRotation.close(); }
+  }
+});
+
+test("rotation counters are shared across response branches within one stable client session", async (t) => {
+  const f = await fixture(t, { maxMessages: undefined, stateful: { maxRequests: 2 } });
+  const opts = { headers: { "session-id": "branched-client" } };
+  const first = await f.turn({ input: "first" }, opts);
+  await f.turn({ input: "branch-a", previous_response_id: first.id }, opts);
+  await f.turn({ input: "branch-b", previous_response_id: first.id }, opts);
+  assert.equal(f.calls[0].sessionId, "branched-client"); assert.equal(f.calls[1].sessionId, "branched-client");
+  assert.notEqual(f.calls[2].sessionId, "branched-client");
+});
+
+
+test("recovering a truncated response advances its stable-session counter before the next rotation", async (t) => {
+  const f = await fixture(t, { maxMessages: undefined, stateful: { maxRequests: 2 } });
+  const opts = { headers: { "session-id": "recover-client" } };
+  const first = await f.turn({ input: "first" }, opts);
+  const broken = await f.request({ previous_response_id: first.id, input: "second", stream: true, metadata: { truncate: true } }, opts);
+  await assert.rejects(() => broken.text());
+  const secondId = [...f.responses.keys()].at(-1);
+  await f.restart();
+  await f.turn({ previous_response_id: secondId, input: "third" }, opts);
+  assert.equal(f.calls[0].sessionId, "recover-client"); assert.equal(f.calls[1].sessionId, "recover-client");
+  assert.notEqual(f.calls[2].sessionId, "recover-client");
+});
+
+
+const alphaRequest = () => ({ id: "search-request-id", input: loopHistory(20),
+  commands: { search_query: [{ q: "current release", recency: 7 }], open: [{ ref_id: "https://example.com", lineno: 12 }], find: [{ ref_id: "turn0search0", pattern: "version" }] },
+  settings: { external_web_access: true, filters: { allowed_domains: ["example.com"] } }, max_output_tokens: 2500,
+});
+
+test("alpha search is opt-in, POST-only and never enters inference or compression", async (t) => {
+  for (const enableAlphaSearch of [undefined, false, true]) {
+    const f = await fixture(t, { enableAlphaSearch });
+    const body = alphaRequest(), response = await f.request(body, { path: "/alpha/search", headers: { "user-agent": "Codex TUI test", "x-codex-turn-metadata": "retain-metadata", "x-openai-actor-authorization": "gateway-only" } });
+    assert.equal(response.status, enableAlphaSearch ? 200 : 404);
+    const data = await response.json();
+    if (enableAlphaSearch) {
+      assert.equal(data.encrypted_output, "opaque-search-state"); assert.equal(data.results[0].ref_id, "turn0search0");
+      assert.equal(response.headers.get("x-native-search"), "retained");
+      assert.deepEqual(f.alphaSearches[0].body, { model: "test", ...body });
+      assert.equal(f.alphaSearches[0].headers.authorization, "Bearer tenant-a");
+      assert.equal(f.alphaSearches[0].headers["user-agent"], "Codex TUI test");
+      assert.equal(f.alphaSearches[0].headers["x-codex-turn-metadata"], "retain-metadata");
+      assert.equal(f.alphaSearches[0].headers["x-openai-actor-authorization"], undefined);
+      const wrongMethod = await f.request(null, { path: "/alpha/search", method: "GET" });
+      assert.equal(wrongMethod.status, 405); await wrongMethod.json();
+    } else assert.equal(f.alphaSearches.length, 0);
+    assert.equal(f.calls.length, 0); assert.equal(f.compactions.length, 0); assert.equal(f.compactEndpoints.length, 0); assert.equal(f.summaries.length, 0);
+  }
+});
+
+test("alpha search preserves raw JSON, encrypted output, upstream errors and provider isolation", async (t) => {
+  const seen = [], text = '{ "encrypted_output": "opaque", "output": "unchanged", "results": [] }';
+  const f = await fixture(t, { maxMessages: undefined, enableAlphaSearch: true }, async (url, init) => {
+    seen.push({ url: String(url), body: init.body });
+    return new Response(seen.length === 1 ? text : '{"error":{"code":"search_refused"}}', {
+      status: seen.length === 1 ? 200 : 429, headers: { "content-type": "application/json", "x-upstream": "keep" },
+    });
+  });
+  const owner = await f.secondOwner(); t.after(() => owner.close());
+  const raw = '{ "model": "test", "commands": { "open": [{"ref_id":"https://example.com"}] }, "extra": true }';
+  // Use the stubbed transport so upstream JSON never gets parsed/reencoded.
+  const response = await f.request(alphaRequest(), { path: "/alpha/search?trace=1" });
+  assert.equal(await response.text(), text); assert.match(seen[0].url, /alpha\/search\?trace=1$/);
+  const failed = await f.request(alphaRequest(), { path: "/alpha/search" });
+  assert.equal(failed.status, 429); assert.equal(await failed.text(), '{"error":{"code":"search_refused"}}');
+  assert.equal(failed.headers.get("x-upstream"), "keep");
+  const forbidden = await f.request(alphaRequest(), { path: "/alpha/search/other" });
+  assert.equal(forbidden.status, 404); await forbidden.json();
+  assert.equal(seen.length, 2);
+  // A real native route accepts arbitrary future fields and preserves bytes.
+  const native = await owner.fetch("limited", f.upstreamURL.replace("responses", "alpha/search"), { method: "POST", headers: { authorization: "Bearer tenant-a", "content-type": "application/json" }, body: raw });
+  assert.equal(native.status, 200); await native.json();
+  assert.equal(f.alphaSearches[0].raw, raw);
+});
+
+test("alpha search follows committed session rotation without incrementing or resetting request counts", async (t) => {
+  const f = await fixture(t, { enableAlphaSearch: true, stateful: { maxRequests: 2 } });
+  const opts = { headers: { "session-id": "search-client", "thread-id": "search-client", "x-codex-turn-state": "old-state" } };
+  const search = async () => {
+    const response = await f.request({ ...alphaRequest(), prompt_cache_key: "search-client" }, { ...opts, path: "/alpha/search" });
+    assert.equal(response.status, 200); await response.json(); return f.alphaSearches.at(-1);
+  };
+  assert.equal((await search()).sessionId, "search-client");
+  await f.turn({ input: "one", prompt_cache_key: "search-client", store: false }, opts);
+  await search(); await search();
+  await f.turn({ input: "two", prompt_cache_key: "search-client", store: false }, opts);
+  assert.equal(f.calls.at(-1).sessionId, "search-client");
+  assert.equal((await search()).sessionId, "search-client", "Searching at the limit must not rotate by itself");
+  await f.turn({ input: "three", prompt_cache_key: "search-client", store: false }, opts);
+  const mapped = f.calls.at(-1).sessionId; assert.notEqual(mapped, "search-client");
+  await f.restart();
+  const actual = await search(); assert.equal(actual.sessionId, mapped); assert.equal(actual.body.prompt_cache_key, mapped);
+  assert.equal(actual.body.id, "search-request-id"); assert.equal(actual.headers["x-codex-turn-state"], undefined);
+  const isolated = await f.request({ ...alphaRequest(), prompt_cache_key: "search-client" }, { ...opts, key: "tenant-b", path: "/alpha/search" });
+  assert.equal(isolated.status, 200); await isolated.json();
+  assert.equal(f.alphaSearches.at(-1).sessionId, "search-client", "Another account must not reuse this tenant's session mapping");
+  await f.turn({ input: "four", prompt_cache_key: "search-client", store: false }, opts);
+  assert.equal(f.calls.at(-1).sessionId, mapped); assert.equal(f.compactions.length, 0);
 });

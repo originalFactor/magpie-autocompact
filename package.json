@@ -32,7 +32,7 @@
   "magpie": {
     "name": "自动上下文压缩",
     "options": {
-      "provider": null
+      "providers": {}
     }
   }
 }
