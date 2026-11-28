@@ -246,6 +246,22 @@ test("truncated Responses notice streams recover the upstream reply after restar
   assert.equal((await retrieved.json()).output[0].content[0].text, `上下文已压缩到 ${f.calls[0].body.input.length} 条消息。\n\n`);
 });
 
+test("truncated stateless inference reuses the completed compaction on retry", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
+  const input = loopHistory();
+  const response = await f.request({ input, store: false, stream: true, metadata: { truncate: true } });
+  const reader = response.body.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  const notice = first.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6))).find((event) => event.type === "response.output_item.done").item;
+  await assert.rejects(async () => { while (!(await reader.read()).done) {} });
+  assert.equal(f.compactions.length, 1);
+  await f.restart();
+  await f.turn({ input: [...input, notice, { role: "assistant", content: " " }], store: false });
+  assert.equal(f.compactions.length, 1, "retry should reuse the successful compaction");
+  assert.equal(f.calls.at(-1).body.input[0].type, "compaction");
+});
+
 test("Responses compaction notice continues inference after pack fallback", async (t) => {
   const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
   f.failCompaction(); f.failCompactEndpoint(); f.failSummary();

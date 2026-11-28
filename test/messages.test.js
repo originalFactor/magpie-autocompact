@@ -107,7 +107,7 @@ for (const protocol of ["chat", "anthropic"]) {
     }
   });
 
-  test(`${protocol}: notice streams fail on rejected or truncated inference without caching success`, async (t) => {
+  test(`${protocol}: notice streams fail on rejected or truncated inference while retaining compaction`, async (t) => {
     const f = await fixture(t, protocol, { compactionNotice: true });
     f.controls.reject = true;
     await assert.rejects(async () => (await f.request({ messages: history(), stream: true })).text());
@@ -115,7 +115,7 @@ for (const protocol of ["chat", "anthropic"]) {
     await assert.rejects(async () => (await f.request({ messages: history(), stream: true })).text());
     f.controls.truncate = false;
     await (await f.request({ messages: history() })).json();
-    assert.equal(f.summaries.length, 3);
+    assert.equal(f.summaries.length, 1);
   });
 
   test(`${protocol}: notice only follows successful compaction, including pack fallback`, async (t) => {
@@ -212,12 +212,12 @@ for (const protocol of ["chat", "anthropic"]) {
     assert.equal(f.summaries.length, 1);
   });
 
-  test(`${protocol}: truncated streams and rejected inference do not publish cached prefixes or new IDs`, async (t) => {
+  test(`${protocol}: truncated streams reuse compaction without publishing new session IDs`, async (t) => {
     const f = await fixture(t, protocol); f.controls.truncate = true;
     await assert.rejects(async () => { const response = await f.request({ messages: history(), stream: true }); await response.text(); });
     await f.restart(); f.controls.truncate = false; f.controls.reject = true;
     const rejected = await f.request({ messages: history() }); assert.equal(rejected.status, 400); await rejected.text();
-    assert.equal(f.summaries.length, 2);
+    assert.equal(f.summaries.length, 1);
     f.controls.reject = false;
     const small = await f.request({ messages: [{ role: "user", content: "small retry" }] }); await small.json();
     assert.equal(f.calls.at(-1).headers["session-id"], "client-session");
