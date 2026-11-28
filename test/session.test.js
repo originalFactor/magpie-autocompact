@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createSessionTransport } from "../lib/session-transport.js";
 import { clientSessionKey, mappedRequest } from "../lib/session-identity.js";
+import { historyPrefixKeys } from "../lib/history-cache.js";
 
 async function fixture(t, policy = {}, fetchImpl) {
   const root = await mkdtemp(join(tmpdir(), "magpie-server-session-test-"));
@@ -247,7 +248,7 @@ test("truncated Responses notice streams recover the upstream reply after restar
 });
 
 test("truncated stateless inference reuses the completed compaction on retry", async (t) => {
-  const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true, diagnostics: true });
   const input = loopHistory();
   const response = await f.request({ input, store: false, stream: true, metadata: { truncate: true } });
   const reader = response.body.getReader();
@@ -260,6 +261,9 @@ test("truncated stateless inference reuses the completed compaction on retry", a
   await f.turn({ input: [...input, notice, { role: "assistant", content: " " }], store: false });
   assert.equal(f.compactions.length, 1, "retry should reuse the successful compaction");
   assert.equal(f.calls.at(-1).body.input[0].type, "compaction");
+  const events = (await readFile(join(f.root, "diagnostics.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(events.some((event) => event.event === "inference_stream_failed"));
+  assert.equal(events.filter((event) => event.event === "planning").at(-1).cache.matchedPrefix, input.length);
 });
 
 test("Responses compaction notice continues inference after pack fallback", async (t) => {
@@ -730,6 +734,39 @@ test("full-history Codex tool loops continue beyond 100 model turns with bounded
   assert.ok(f.compactions.slice(1).every((p) => p.input.some((i) => i.type === "compaction")));
   assert.ok(f.calls.every((call) => call.sessionId === undefined));
   assert.ok(f.compactions.every((call) => call.sessionId === undefined));
+});
+
+test("diagnostics records cache and blank message shapes without conversation contents or credentials", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, diagnostics: true });
+  const input = loopHistory();
+  input[0].content = "private-message-example";
+  input.push({ type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: " " }] });
+  const first = await f.turn({ input, store: false, metadata: { tool: true } }, { headers: { "session-id": "private-session-example" } });
+  await f.turn({ input: [...input, ...first.output, { type: "function_call_output", call_id: "active_call", output: "private-tool-example" }], store: false }, { headers: { "session-id": "private-session-example" } });
+  const log = await readFile(join(f.root, "diagnostics.jsonl"), "utf8");
+  assert.doesNotMatch(log, /private-message-example|private-tool-example|private-session-example|tenant-a/);
+  const events = log.trim().split("\n").map((line) => JSON.parse(line));
+  const plans = events.filter((event) => event.event === "planning");
+  assert.equal(plans.length, 2);
+  assert.equal(plans[0].compressionRequired, true);
+  assert.equal(plans[0].cache.matchedPrefix, 0);
+  assert.ok(plans[0].incoming.items.some((item) => item.role === "assistant" && item.phase === "commentary" && item.blankText));
+  assert.equal(plans[1].cache.matchedPrefix, input.length);
+  assert.equal(plans[1].compressionRequired, false);
+  assert.ok(events.some((event) => event.event === "compaction_completed" && event.method === "compaction"));
+  assert.ok(events.some((event) => event.event === "inference_completed" && event.output.items.some((item) => item.type === "function_call")));
+});
+
+test("diagnostic logging is disabled by default", async (t) => {
+  const f = await fixture(t);
+  await f.turn({ input: "hello", store: false });
+  await assert.rejects(readFile(join(f.root, "diagnostics.jsonl"), "utf8"), { code: "ENOENT" });
+});
+
+test("enabling diagnostics does not invalidate history cache keys", () => {
+  const input = loopHistory();
+  assert.deepEqual(historyPrefixKeys({ model: "test" }, input, { maxMessages: 8 }),
+    historyPrefixKeys({ model: "test" }, input, { maxMessages: 8, diagnostics: true }));
 });
 
 test("compaction notice continues tool calls through repeated native compaction", async (t) => {

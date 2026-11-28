@@ -66,7 +66,7 @@ test("configuration validates thresholds, URLs and protocol before registration"
   for (const change of [
     { baseURL: "file:///tmp/test" }, { baseURL: "https://user:pass@example.com/v1" },
     { baseURL: "https://example.com/v1/responses" }, { maxMessages: -1 }, { maxMessages: 2.5 },
-    { maxRequests: -1 }, { maxRequests: 2.5 }, { enablePack: "false" }, { protocol: "invalid" },
+    { maxRequests: -1 }, { maxRequests: 2.5 }, { enablePack: "false" }, { protocol: "invalid" }, { diagnostics: "true" },
     ...[0, -0.1, 1.1, null, "0.5"].map((compactionTargetRatio) => ({ compactionTargetRatio })),
     ...[0, -1, 1.5, null, "0.5"].map((maxRetainedRatio) => ({ maxRetainedRatio })),
     { maxRetainedMessages: 2 },

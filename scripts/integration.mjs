@@ -374,7 +374,7 @@ try {
   assert.notEqual(upstreamSessions.at(-1).id, upstreamSessions.at(-2).id);
   await stopGateway();
   const multi = { providers: {
-    compact_a: { name: "配置供应商 A", baseURL: `${upstreamURL}/v1`, key: "configured-key-a", models: ["test"], maxMessages: 6, enablePack: true, enableAlphaSearch: true, compactionNotice: true },
+    compact_a: { name: "配置供应商 A", baseURL: `${upstreamURL}/v1`, key: "configured-key-a", models: ["test"], maxMessages: 6, enablePack: true, enableAlphaSearch: true, compactionNotice: true, diagnostics: true },
     compact_b: { name: "配置供应商 B", baseURL: `${upstreamURL}/v1`, apiKey: "configured-key-b", enablePack: false },
     chat_upstream: { protocol: "chat", baseURL: `${upstreamURL}/v1`, key: "configured-chat-key", models: ["chat-test"], maxMessages: 6, enablePack: false, compactionNotice: true },
     anthropic_upstream: { protocol: "anthropic", baseURL: `${upstreamURL}/v1`, key: "configured-anthropic-key", models: ["anthropic-test"], maxMessages: 6, enablePack: true, compactionNotice: true },
@@ -404,6 +404,11 @@ try {
   }
   const noticeReply = await request("responses", { model: "compact_a/test", input: messages, stream: false });
   assert.match(noticeReply, /上下文已压缩/); assert.match(noticeReply, /native reply/);
+  const diagnosticsText = await readFile(join(sandbox, ".state", "magpie-autocompact", "compact_a", "diagnostics.jsonl"), "utf8");
+  const diagnostics = diagnosticsText.trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(diagnostics.some((event) => event.event === "planning" && event.compressionRequired));
+  assert.ok(diagnostics.some((event) => event.event === "compaction_completed"));
+  assert.doesNotMatch(diagnosticsText, /configured-key-a|native reply/);
   assert.equal(upstreamCredentials.at(-1), "Bearer configured-key-a");
   assert.ok(upstreamRequests.at(-1).input.length <= 6);
   await request("responses", { model: "compact_b/test", input: messages, stream: false });

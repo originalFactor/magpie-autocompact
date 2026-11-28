@@ -56,6 +56,10 @@
       // 默认 false；true 按实际压缩方式和保留条数显示提示。
       "compactionNotice": false,
 
+      // 可选诊断日志：记录输入项结构、空白消息、缓存命中和压缩结果，不记录正文或凭据。
+      // 输出到 stateDir/diagnostics.jsonl，默认关闭；启用后持续追加。
+      "diagnostics": false,
+
       // 与压缩独立：省略或 0 表示永不更换 session ID。
       // 例如改为 80：前 80 次成功推理保持 ID，下一次推理前尝试轮换。
       // 内部压缩、摘要及 alpha 搜索不计数；压缩本身不换 ID，也不重置计数。
