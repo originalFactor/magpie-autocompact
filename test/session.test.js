@@ -487,6 +487,34 @@ test("both native failures use a same-provider summary without changing session 
   assert.equal(f.calls.at(-1).sessionId, generation);
 });
 
+test("summary and pack fallbacks use Codex's original history after a cached Responses compaction", async (t) => {
+  for (const fallback of ["summary", "pack"]) {
+    const f = await fixture(t, { maxMessages: 8 });
+    const history = (length) => Array.from({ length }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user", content: `original turn ${index}: ${"keep this context ".repeat(8)}`,
+    }));
+    const options = { headers: { "session-id": `raw-history-${fallback}` } };
+    const request = (input) => f.turn({ input, prompt_cache_key: `raw-history-${fallback}`, store: false }, options);
+
+    await request(history(9));
+    assert.equal(f.compactions.length, 1, "the initial history is compacted successfully");
+    f.failCompaction(); f.failCompactEndpoint();
+    if (fallback === "pack") f.failSummary();
+    await request(history(17));
+
+    assert.equal(f.compactions.length, 2);
+    assert.match(JSON.stringify(f.compactions.at(-1).input), /sealed-prefix/, "native compaction still receives the cached prefix");
+    assert.equal(f.summaries.length, 1);
+    const summaryInput = JSON.stringify(f.summaries[0].body.input);
+    assert.match(summaryInput, /original turn 0/);
+    assert.doesNotMatch(summaryInput, /sealed-prefix/);
+    const inferenceInput = JSON.stringify(f.calls.at(-1).body.input);
+    assert.doesNotMatch(inferenceInput, /sealed-prefix/);
+    assert.match(inferenceInput, fallback === "summary" ? /Historical task summary/ : /original_messages_json/);
+    assert.match(inferenceInput, /original turn 16/);
+  }
+});
+
 test("Responses summary fallback honors an external summarizer and isolates its credentials", async (t) => {
   const f = await fixture(t, { summary: { provider: "summary-fixture", model: "small" } });
   f.failCompaction(); f.failCompactEndpoint();
