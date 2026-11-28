@@ -67,8 +67,12 @@ test("configuration validates thresholds, URLs and protocol before registration"
     { baseURL: "file:///tmp/test" }, { baseURL: "https://user:pass@example.com/v1" },
     { baseURL: "https://example.com/v1/responses" }, { maxMessages: -1 }, { maxMessages: 2.5 },
     { maxRequests: -1 }, { maxRequests: 2.5 }, { enablePack: "false" }, { protocol: "invalid" },
-    ...["", "  ", null, 1, {}, []].map((compactionNotice) => ({ compactionNotice })),
+    ...[0, -0.1, 1.1, null, "0.5"].map((compactionTargetRatio) => ({ compactionTargetRatio })),
+    ...[0, -1, 1.5, null, "0.5"].map((maxRetainedRatio) => ({ maxRetainedRatio })),
+    { maxRetainedMessages: 2 },
+    ...["", "  ", "custom", null, 1, {}, []].map((compactionNotice) => ({ compactionNotice })),
   ]) await assert.rejects(plugin.server(client, { providers: { test: { ...base, ...change } } }));
+  assert.equal(providerSettings({ ...base, compactionTargetRatio: 0.25 }, "test").transportOptions.providers.test.compactionTargetRatio, 0.25);
   assert.equal(apiBase("https://example.com/v1///").href, "https://example.com/v1/");
 });
 

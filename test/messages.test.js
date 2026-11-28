@@ -82,7 +82,7 @@ for (const protocol of ["chat", "anthropic"]) {
     let release;
     const waiting = new Promise((resolve) => { release = resolve; });
     t.after(() => release());
-    const f = await fixture(t, protocol, { compactionNotice: "Compacted" }, async (url, init) => {
+    const f = await fixture(t, protocol, { compactionNotice: true }, async (url, init) => {
       const body = JSON.parse(init.body);
       const summary = (protocol === "chat" ? body.messages[0].content : body.system)?.startsWith?.("Summarize the historical conversation");
       if (!summary) await waiting;
@@ -91,7 +91,7 @@ for (const protocol of ["chat", "anthropic"]) {
     const response = await f.request({ messages: history(), stream: true });
     const reader = response.body.getReader();
     const first = new TextDecoder().decode((await reader.read()).value);
-    assert.match(first, /Compacted/);
+    assert.match(first, /上下文已摘要/);
     assert.doesNotMatch(first, /\[DONE\]|message_stop/);
     assert.equal(f.calls.length, 0);
     release();
@@ -127,10 +127,10 @@ for (const protocol of ["chat", "anthropic"]) {
     const packed = await f.request({ messages: history() });
     const reply = await packed.json();
     assert.equal(packed.status, 200);
-    assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), "上下文已压缩，请继续。\n\nACK");
+    assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), `上下文已打包到 ${f.calls.at(-1).body.messages.length} 条消息。\n\nACK`);
     assert.equal(f.calls.length, 2);
     const opaque = history().map((item) => ({ ...item }));
-    opaque[0].content = [{ type: "image", source: { type: "base64", media_type: "image/png", data: "opaque" } }];
+    opaque[0].content = [{ type: "unknown_opaque", data: "opaque" }];
     const failed = await f.request({ messages: opaque });
     assert.equal(failed.status, 422);
     assert.equal((await failed.json()).error.code, "compaction_failed");
@@ -139,22 +139,22 @@ for (const protocol of ["chat", "anthropic"]) {
 
   for (const stream of [false, true]) {
     test(`${protocol}: compaction notice precedes inference and persists the prefix (stream=${stream})`, async (t) => {
-      const f = await fixture(t, protocol, { compactionNotice: "压缩完成，可以继续。" });
+      const f = await fixture(t, protocol, { compactionNotice: true });
       const messages = history();
       const response = await f.request({ messages, stream });
       assert.equal(response.status, 200);
       if (stream) {
         const events = await response.text();
-        assert.match(events, /压缩完成，可以继续。/);
+        assert.match(events, /上下文已摘要到 \d+ 条消息。/);
         assert.match(events, protocol === "chat" ? /\[DONE\]/ : /message_stop/);
       } else {
         const reply = await response.json();
-        assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), "压缩完成，可以继续。\n\nACK");
+        assert.equal(protocol === "chat" ? reply.choices[0].message.content : reply.content.map((part) => part.text).join(""), `上下文已摘要到 ${f.calls.at(-1).body.messages.length} 条消息。\n\nACK`);
       }
       assert.equal(f.calls.length, 1);
       assert.equal(f.summaries.length, 1);
       await f.restart();
-      const next = await f.request({ messages: [...messages, { role: "assistant", content: "压缩完成，可以继续。" }, { role: "user", content: "continue" }] });
+      const next = await f.request({ messages: [...messages, { role: "assistant", content: "上下文已摘要。" }, { role: "user", content: "continue" }] });
       assert.equal(next.status, 200); await next.json();
       assert.equal(f.summaries.length, 1);
       assert.equal(f.calls.length, 2);

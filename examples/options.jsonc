@@ -44,8 +44,16 @@
       // 严格超过 80 才压缩。省略或设为 0：不压缩，直接转发历史。
       "maxMessages": 80,
 
+      // 压缩后尽量保留 maxMessages 的此比例；范围 (0, 1]，默认 0.5。
+      // 例如 0.5 目标为 40 条；安全边界或必须保留的内容可能使结果高于目标。
+      "compactionTargetRatio": 0.5,
+
+      // 可选：安全切分超过此比例时允许强制压缩、摘要或打包整个历史，包括当前输入和工具调用。
+      // 范围 (0, 1]；省略时禁用。已有加密上下文无法由普通摘要模型解读。
+      // "maxRetainedRatio": 0.8,
+
       // 压缩成功后先输出 assistant 提示，再在同一次响应中继续请求上游并输出模型回复。
-      // 默认 false；true 使用“上下文已压缩，请继续。”；非空字符串自定义提示，提示与回复以空行分隔。
+      // 默认 false；true 按实际压缩方式和保留条数显示提示。
       "compactionNotice": false,
 
       // 与压缩独立：省略或 0 表示永不更换 session ID。
@@ -55,7 +63,7 @@
 
       // 压缩顺序固定：trigger > /responses/compact > summary > pack。
       // false 禁用最后一级 pack；所有启用阶段均失败时返回 422 / compaction_failed。
-      // pack 只减少消息数，不减少 token；不会把不透明或多模态数据硬转成文本。
+      // pack 只减少消息数，不减少 token；支持的媒体以原生输入块保留，不透明内容会失败。
       "enablePack": true, // 可省略，默认 true。
 
       // 可选的 Codex 原生 POST /alpha/search，默认 false，仅支持 Responses。

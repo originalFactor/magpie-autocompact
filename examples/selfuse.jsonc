@@ -9,7 +9,9 @@
         "User-Agent": "codex_cli_rs/0.172.0 (Windows; x86_64) WindowsTerminal" // 绕过中转站客户端限制
       },
       "key": "sk-xxx",
-      "maxMessages": 80, // 80 条消息后压缩, 用户消息/agent消息/工具调用都算一条
+      "maxMessages": 98, // 80 条消息后压缩, 用户消息/agent消息/工具调用都算一条
+      "compactionTargetRatio": 0.2, // 压缩后尽量保留的比例，范围 (0, 1]，默认 0.5
+      "maxRetainedRatio": 0.8, // 显式启用：安全切分超过比例时强制压缩整个历史
       "name": "example", // 显示名称
       "responses": {
         "maxInputChars": 10000000, // 历史前缀 JSON 的字符数上限；0 为不限。

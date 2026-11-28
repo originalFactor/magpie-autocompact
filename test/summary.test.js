@@ -162,7 +162,7 @@ test("document summaries convert inline PDFs across all three protocols", () => 
   }
 });
 
-test("non-text summaries preserve the current input and fail without packing away media", async () => {
+test("non-text summaries and pack fallback preserve media and the current input", async () => {
   for (const block of [
     { type: "input_audio", input_audio: { data: "AAAA", format: "wav" } },
     { type: "file", file: { file_data: "data:application/pdf;base64,AAAA", filename: "report.pdf" } },
@@ -176,7 +176,9 @@ test("non-text summaries preserve the current input and fail without packing awa
     } });
     assert.deepEqual(result.messages.at(-1), messages.at(-1));
     assert.deepEqual(body, original);
-    await assert.rejects(compactHistory(body, "chat", { maxMessages: 6 }, { summaryPost: async () => { throw new Error("unavailable"); } }),
-      (error) => error.attempts.at(-1).method === "pack" && error.attempts.at(-1).code === "no_safe_cut");
+    const packed = await compactHistory(body, "chat", { maxMessages: 6 }, { summaryPost: async () => { throw new Error("unavailable"); } });
+    assert.deepEqual(packed.messages[0].content[1], block);
+    assert.match(packed.messages[0].content[0].text, /historical_media/);
+    assert.deepEqual(packed.messages.at(-1), messages.at(-1));
   }
 });

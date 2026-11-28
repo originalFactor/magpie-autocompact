@@ -178,10 +178,10 @@ for (const stream of [false, true]) {
       const events = (await response.text()).split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
       assert.equal(events[0].type, "response.created");
       assert.equal(events.at(-1).type, "response.completed");
-      assert.equal(events.find((event) => event.type === "response.output_text.delta").delta, "上下文已压缩，请继续。\n\n");
+      assert.equal(events.find((event) => event.type === "response.output_text.delta").delta, `上下文已压缩到 ${f.calls[0].body.input.length} 条消息。\n\n`);
       reply = events.at(-1).response;
     } else reply = await response.json();
-    assert.equal(reply.output[0].content[0].text, "上下文已压缩，请继续。\n\n");
+    assert.equal(reply.output[0].content[0].text, `上下文已压缩到 ${f.calls[0].body.input.length} 条消息。\n\n`);
     assert.equal(f.calls.length, 1);
     assert.equal(reply.output.length, 2);
     assert.match(reply.output[1].content[0].text, /reply resp_/);
@@ -203,7 +203,7 @@ test("Responses notice is readable before upstream headers and shares one respon
   let release;
   const waiting = new Promise((resolve) => { release = resolve; });
   t.after(() => release());
-  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Compacted" }, async (url, init) => {
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true }, async (url, init) => {
     const body = init.body && JSON.parse(init.body);
     if (body?.input?.at(-1)?.type !== "compaction_trigger") await waiting;
     return fetch(url, init);
@@ -212,7 +212,7 @@ test("Responses notice is readable before upstream headers and shares one respon
   const response = await f.request({ input, stream: true, metadata: { tool: true } });
   const reader = response.body.getReader();
   let text = new TextDecoder().decode((await reader.read()).value);
-  assert.match(text, /Compacted/);
+  assert.match(text, /上下文已压缩/);
   assert.doesNotMatch(text, /response.completed/);
   assert.equal(f.calls.length, 0);
   release();
@@ -231,7 +231,7 @@ test("Responses notice is readable before upstream headers and shares one respon
 });
 
 test("truncated Responses notice streams recover the upstream reply after restart", async (t) => {
-  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Compacted" });
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
   const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
   const response = await f.request({ input, stream: true, metadata: { truncate: true } });
   const reader = response.body.getReader();
@@ -243,27 +243,54 @@ test("truncated Responses notice streams recover the upstream reply after restar
   assert.equal(f.calls.length, 2);
   assert.match(JSON.stringify(f.calls[1].body.input), /reply resp_/);
   const retrieved = await f.request(undefined, { path: `/responses/${id}`, method: "GET" });
-  assert.equal((await retrieved.json()).output[0].content[0].text, "Compacted\n\n");
+  assert.equal((await retrieved.json()).output[0].content[0].text, `上下文已压缩到 ${f.calls[0].body.input.length} 条消息。\n\n`);
 });
 
 test("Responses compaction notice continues inference after pack fallback", async (t) => {
-  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Packed" });
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
   f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
   const input = Array.from({ length: 9 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: `turn ${index}` }));
   const reply = await f.turn({ input, store: false });
-  assert.equal(reply.output[0].content[0].text, "Packed\n\n");
+  assert.equal(reply.output[0].content[0].text, `上下文已打包到 ${f.calls[0].body.input.length} 条消息。\n\n`);
   assert.equal(f.calls.length, 1);
   await f.restart();
-  await f.turn({ input: [...input, { role: "assistant", content: "Packed" }, { role: "user", content: "continue" }], store: false });
+  await f.turn({ input: [...input, { role: "assistant", content: reply.output[0].content[0].text }, { role: "user", content: "continue" }], store: false });
   assert.equal(f.calls.length, 2);
   assert.match(f.calls[1].body.input[0].content, /original_messages_json/);
 });
 
+test("Responses media survives pack fallback, replay, and provider restart", async (t) => {
+  const f = await fixture(t, { maxMessages: 8 });
+  f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
+  const media = { type: "input_image", image_url: "https://example.test/screenshot.png" };
+  const input = loopHistory();
+  input[0].content = [{ type: "input_text", text: "Inspect the image" }, media];
+  const reply = await f.turn({ input, store: false });
+  const packed = f.calls.at(-1).body.input;
+  assert.deepEqual(packed[0].content[1], media);
+  assert.match(packed[0].content[0].text, /historical_media/);
+  await f.restart();
+  await f.turn({ input: [...input, ...reply.output, { role: "user", content: "Continue" }], store: false });
+  assert.deepEqual(f.calls.at(-1).body.input[0].content[1], media);
+});
+
+for (const stream of [false, true]) {
+  test(`forced pack notice reports the retained item count (stream=${stream})`, async (t) => {
+    const f = await fixture(t, { maxMessages: 8, maxRetainedRatio: 0.125, compactionNotice: true });
+    f.failCompaction(); f.failCompactEndpoint(); f.failSummary();
+    const response = await f.request({ input: loopHistory(), store: false, stream });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, new RegExp(`上下文已强制打包到 ${f.calls[0].body.input.length} 条消息。`));
+    assert.match(JSON.stringify(f.calls[0].body.input), /result 7/);
+  });
+}
+
 test("conversation compaction notice updates the shadow before returning", async (t) => {
-  const f = await fixture(t, { maxMessages: 8, compactionNotice: "Ready to continue" });
+  const f = await fixture(t, { maxMessages: 8, compactionNotice: true });
   f.conversations.set("conv_notice", Array.from({ length: 8 }, (_, index) => ({ id: `item_notice_${index}`, role: index % 2 ? "assistant" : "user", content: `turn ${index}` })));
   const reply = await f.turn({ conversation: "conv_notice", input: "new task" });
-  assert.equal(reply.output[0].content[0].text, "Ready to continue\n\n");
+  assert.equal(reply.output[0].content[0].text, `上下文已压缩到 ${f.calls[0].history.length} 条消息。\n\n`);
   assert.equal(f.calls.length, 1);
   await f.restart();
   await f.turn({ conversation: "conv_notice", input: "continue" });
@@ -645,6 +672,34 @@ function loopHistory(n = 8) {
   ]).flat()];
 }
 
+for (const [kind, policy, failNative, expected] of [
+  ["summary", {}, true, "上下文已摘要到"],
+  ["forced native", { maxRetainedRatio: 0.125 }, false, "上下文已强制压缩到"],
+  ["forced summary", { maxRetainedRatio: 0.125 }, true, "上下文已强制摘要到"],
+]) for (const streaming of [false, true]) {
+  test(`notice identifies ${kind} (stream=${streaming})`, async (t) => {
+    const f = await fixture(t, { maxMessages: 8, compactionNotice: true, ...policy });
+    if (failNative) { f.failCompaction(); f.failCompactEndpoint(); }
+    const response = await f.request({ input: loopHistory(), store: false, stream: streaming });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, new RegExp(`${expected} ${f.calls.at(-1).body.input.length} 条消息。`));
+  });
+}
+
+test("forced conversation compaction continues from the fully compacted history", async (t) => {
+  const f = await fixture(t, { maxMessages: 8, maxRetainedRatio: 0.125 });
+  f.conversations.set("conv_client", loopHistory(8).map((item, index) => ({ ...item, id: `item_${index}` })));
+  await f.turn({ conversation: "conv_client", input: "Newest instruction" });
+  assert.equal(f.compactions.length, 1);
+  assert.match(JSON.stringify(f.compactions[0].input), /Newest instruction/);
+  const sent = f.calls.at(-1).body;
+  assert.equal(sent.input.length, 1);
+  assert.match(sent.input[0].content, /Continue the task/);
+  assert.equal(f.calls.at(-1).history.filter((item) => item.content === "Newest instruction").length, 0);
+  assert.ok(f.calls.at(-1).history.some((item) => item.type === "compaction"));
+});
+
 test("full-history Codex tool loops continue beyond 100 model turns with bounded native requests", async (t) => {
   const f = await fixture(t, { maxMessages: 80 });
   f.setModelTurnLimit(100);
@@ -659,6 +714,51 @@ test("full-history Codex tool loops continue beyond 100 model turns with bounded
   assert.ok(f.compactions.slice(1).every((p) => p.input.some((i) => i.type === "compaction")));
   assert.ok(f.calls.every((call) => call.sessionId === undefined));
   assert.ok(f.compactions.every((call) => call.sessionId === undefined));
+});
+
+test("compaction notice continues tool calls through repeated native compaction", async (t) => {
+  const f = await fixture(t, { maxMessages: 16, compactionNotice: true });
+  let input = [{ role: "user", content: "Finish the coding task." }];
+  let notices = 0;
+  for (let i = 0; i < 24; i++) {
+    const reply = await f.turn({ input, store: false, metadata: { tool: true } });
+    const notice = reply.output.find((item) => item.type === "message" && item.content?.some((part) => /^上下文已压缩到 \d+ 条消息。\n\n$/.test(part.text)));
+    const call = reply.output.find((item) => item.type === "function_call");
+    assert.ok(call, `tool call missing after model turn ${i}`);
+    if (notice) notices++;
+    input = [...input, ...reply.output, { type: "function_call_output", call_id: call.call_id, output: `step ${i}` }];
+  }
+  assert.ok(notices >= 2, "the loop should continue after multiple compactions");
+  assert.ok(f.compactions.length >= 2);
+  assert.ok(f.compactions.slice(1).every((request) => {
+    const prior = request.input.findIndex((item) => item.type === "compaction");
+    const nextBatch = request.input.slice(prior + 1, -1);
+    return prior >= 0 && nextBatch.some((item) => item.type === "function_call")
+      && nextBatch.some((item) => item.type === "function_call_output");
+  }), "later native compactions should include the previous state and a completed new tool batch");
+  assert.ok(f.calls.every((call) => call.body.input.length <= 16));
+});
+
+test("one tool continuation after maxMessages 80 compaction does not compact again", async (t) => {
+  const f = await fixture(t, { maxMessages: 80, compactionNotice: true });
+  // A recent user turn fits under the limit, but retains almost the entire
+  // active tool loop unless the planner chooses a later safe tool boundary.
+  const history = [{ role: "user", content: "Earlier request." }, ...loopHistory(40)];
+  const first = await f.turn({ input: history, store: false, metadata: { tool: true } });
+  assert.equal(f.compactions.length, 1);
+  assert.ok(f.calls[0].body.input.length <= 40, "compaction should leave room for the tool loop to continue");
+  assert.ok(first.output.some((item) => item.type === "message" && item.content?.some((part) => part.text?.includes("\n\n"))));
+  const call = first.output.find((item) => item.type === "function_call");
+  assert.ok(call);
+
+  const continued = await f.turn({
+    input: [...history, ...first.output, { type: "function_call_output", call_id: call.call_id, output: "one tool result" }],
+    store: false, metadata: { tool: true },
+  });
+  assert.equal(f.compactions.length, 1, "one completed tool batch should fit in the headroom left by compaction");
+  assert.ok(f.calls[1].body.input.length <= 80);
+  assert.ok(f.calls[1].body.input.some((item) => item.type === "compaction"));
+  assert.ok(continued.output.some((item) => item.type === "function_call"));
 });
 
 test("streamed stateless compaction survives restart and SDK envelope normalization", async (t) => {

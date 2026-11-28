@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { plan, applyText, policies, counts } from "../lib/core.js";
-import { compactSession, CompactionError } from "../lib/session-compaction.js";
+import { compactSession, compactHistory, CompactionError, COMPACTION_KIND } from "../lib/session-compaction.js";
 
 function chat(n = 8) {
   return { model: "limited/test", stream: true, messages: [
@@ -25,6 +25,24 @@ function route(body, { policy, protocol }) {
 test("policy validation rejects invalid thresholds and ignores retired controls", () => {
   assert.deepEqual(policies({ providers: { a: { maxMessages: 2.5 }, b: { enablePack: null }, c: false, d: { maxMessages: 4, enabled: false }, e: { maxMessages: -1 } } }), []);
   assert.equal(policies({ providers: { limited: 6 } })[0][1].maxMessages, 6);
+});
+
+test("compaction target ratio controls retained history across protocols", () => {
+  for (const protocol of ["responses", "chat", "anthropic"]) {
+    const key = protocol === "responses" ? "input" : "messages";
+    const body = { [key]: Array.from({ length: 21 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `item ${i}` })) };
+    const native = protocol === "responses";
+    const remaining = (ratio) => {
+      const p = plan(body, protocol, { maxMessages: 10, ...(ratio === undefined ? {} : { compactionTargetRatio: ratio }) }, native, native ? 1 : 0);
+      assert.ok(p);
+      return (native ? 1 : 0) + p.tail.length;
+    };
+    assert.equal(remaining(), remaining(0.5));
+    assert.ok(remaining(0.25) <= 2);
+    assert.ok(remaining(0.75) <= 7);
+    assert.ok(remaining(0.25) < remaining(0.75));
+    assert.ok(remaining(1) <= 10);
+  }
 });
 
 test("packs old text, pins instructions, preserves current input and request controls", () => {
@@ -205,6 +223,66 @@ test("last fallback tool-loop pack preserves every historical item and the activ
   assert.deepEqual([...prefix, ...result.input.slice(1)], body.input);
 });
 
+for (const protocol of ["responses", "chat", "anthropic"]) {
+  test(`${protocol}: forced pack includes the final item and continues the task`, async () => {
+    const key = protocol === "responses" ? "input" : "messages";
+    const items = chat().messages;
+    const body = { model: "test", [key]: items };
+    const result = await compactHistory(body, protocol, { maxMessages: 6, maxRetainedRatio: 0.1 }, {});
+    assert.equal(result[COMPACTION_KIND], "forced_pack");
+    const text = result[key].at(-1).content;
+    assert.deepEqual(JSON.parse(JSON.parse(text.split("\n")[1]).historical_context), items.slice(1));
+    assert.match(text, /Continue the task/);
+    assert.deepEqual(result[key][0], items[0]);
+  });
+}
+
+for (const [protocol, media] of [
+  ["responses", [{ type: "input_image", image_url: "https://example.test/image.png" }, { type: "input_file", file_data: "data:application/pdf;base64,AAAA", filename: "test.pdf" }]],
+  ["chat", [{ type: "image_url", image_url: { url: "https://example.test/image.png" } }, { type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }]],
+  ["anthropic", [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }, { type: "document", source: { type: "base64", media_type: "application/pdf", data: "BBBB" } }]],
+]) for (const forced of [false, true]) {
+  test(`${protocol}: ${forced ? "forced" : "safe"} pack preserves native historical media`, async () => {
+    const key = protocol === "responses" ? "input" : "messages";
+    const items = chat().messages;
+    items[1].content = [{ type: protocol === "responses" ? "input_text" : "text", text: "Look at these files" }, ...media];
+    const body = { model: "test", [key]: items }, original = structuredClone(body);
+    const result = await compactHistory(body, protocol, { maxMessages: 6, ...(forced ? { maxRetainedRatio: 0.1 } : {}) }, {});
+    const content = result[key][1].content;
+    assert.deepEqual(content.slice(1, 3), media);
+    assert.match(content[0].text, /historical_media/);
+    assert.equal(result[COMPACTION_KIND], forced ? "forced_pack" : "pack");
+    if (!forced) assert.equal(result[key].at(-1).content.at(-1).text, body[key].at(-1).content);
+    assert.deepEqual(body, original);
+  });
+}
+
+test("pack rejects media blocks unsupported by the target protocol", async () => {
+  const body = chat();
+  body.messages[1].content = [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }];
+  await assert.rejects(compactHistory(body, "chat", { maxMessages: 6 }, {}),
+    (error) => error instanceof CompactionError && error.attempts.at(-1).code === "unsupported_pack_media");
+});
+
+test("pack preserves media nested in historical tool results and its position", async () => {
+  const image = { type: "input_image", image_url: "https://example.test/tool-image.png" };
+  const body = toolLoop(10);
+  body.input[2].output = [{ type: "input_text", text: "tool screenshot" }, image];
+  const result = await compactSession(body, { maxMessages: 6 }, {});
+  const content = result.input[0].content;
+  assert.deepEqual(content[1], image);
+  const packed = JSON.parse(JSON.parse(content[0].text.split("\n")[1]).historical_context);
+  assert.equal(packed[2].output[1].historical_media, 1);
+  assert.equal(packed[2].output[0].text, "tool screenshot");
+});
+
+test("forced pack rejects opaque and non-text history", async () => {
+  const body = toolLoop(8);
+  body.input.splice(1, 0, { type: "compaction", encrypted_content: "sealed" });
+  await assert.rejects(compactSession(body, { maxMessages: 6, maxRetainedRatio: 0.1 }, {}),
+    (error) => error instanceof CompactionError && error.attempts.at(-1).code === "opaque_pack_input");
+});
+
 test("partial-turn compaction preserves parallel calls, their reasoning and all outputs", async () => {
   const body = toolLoop(10);
   const active = [
@@ -266,6 +344,51 @@ test("Responses compaction falls back to a validated summary after both native m
   assert.deepEqual(order, ["trigger", "compact", "summary"]);
   assert.match(JSON.stringify(result.input), /Keep the goal and pending work/);
   assert.doesNotMatch(JSON.stringify(result.input), /original_messages_json/);
+});
+
+test("retention ratio forces native compaction through the final item", async () => {
+  const body = { model: "test", input: chat().messages };
+  const calls = [];
+  const result = await compactSession(body, { maxMessages: 6, maxRetainedRatio: 0.2 }, {
+    nativePost: async (payload) => { calls.push("native"); assert.match(JSON.stringify(payload.input.at(-2)), /question 7/); return { status: "completed", output: [{ type: "compaction", encrypted_content: "sealed" }] }; },
+  });
+  assert.deepEqual(calls, ["native"]);
+  assert.equal(result.input[1].type, "compaction");
+  assert.match(result.input.at(-1).content, /Continue the task/);
+});
+
+test("retained count at the threshold keeps the native result", async () => {
+  const body = { model: "test", input: chat().messages };
+  const nativePost = async () => ({ status: "completed", output: [{ type: "compaction", encrypted_content: "sealed" }] });
+  const baseline = await compactSession(body, { maxMessages: 6 }, { nativePost });
+  const result = await compactSession(body, { maxMessages: 6, maxRetainedRatio: baseline.input.length / 6 }, {
+    nativePost, summaryPost: async () => { assert.fail("The threshold is strict"); },
+  });
+  assert.deepEqual(result, baseline);
+});
+
+test("forced summary includes the final item and continuation instructions", async () => {
+  const body = { model: "test", input: chat().messages };
+  const result = await compactSession(body, { maxMessages: 6, maxRetainedRatio: 0.2, enablePack: false }, {
+    nativePost: async () => { throw new Error("unavailable"); },
+    compactPost: async () => { throw new Error("unavailable"); },
+    summaryPost: async (payload) => {
+      assert.match(JSON.stringify(payload.messages[1]), /question 7/);
+      return { choices: [{ finish_reason: "stop", message: { content: "Instructions and next step." } }] };
+    },
+  });
+  assert.match(result.input.at(-1).content, /Instructions and next step/);
+  assert.match(result.input.at(-1).content, /Continue the task/);
+});
+
+test("forced summary does not discard opaque history", async () => {
+  const body = { model: "test", input: chat().messages };
+  body.input.splice(2, 0, { type: "compaction", encrypted_content: "sealed-history" });
+  await assert.rejects(compactSession(body, { maxMessages: 6, maxRetainedRatio: 0.2, enablePack: false }, {
+    nativePost: async () => { throw new Error("unavailable"); },
+    compactPost: async () => { throw new Error("unavailable"); },
+    summaryPost: async () => { assert.fail("Opaque history cannot be summarized as text"); },
+  }), (error) => error instanceof CompactionError && error.attempts.at(-1).code === "opaque_summary_input");
 });
 
 test("Responses compaction reports all failed stages, including incomplete or invalid summaries", async () => {
